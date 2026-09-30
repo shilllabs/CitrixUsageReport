@@ -64,7 +64,7 @@ Two one-row probes run first to establish retention: the oldest session of any k
 
 # 4. What is written, and what anonymization covers
 
-The output files are listed in [README](https://citrix.atlassian.net/wiki/spaces/PUBSEC/pages/1999241260). Three points matter for a review:
+The output files are listed in [README](https://github.com/shilllabs/CitrixUsageReport/blob/main/README.md). Three points matter for a review:
 
 `data.json` is assembled field by field rather than serialised from the internal config, so it never contains credential material. It carries a `FetchWarnings` list naming any entity whose fetch came back incomplete — entity names and counts only.
 
