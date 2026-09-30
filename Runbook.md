@@ -13,7 +13,7 @@
 
 # 1. Setup
 
-**Prerequisites:** PowerShell 5.1 (built into Windows 10/11); network access to a Delivery Controller or the Citrix Cloud endpoint for your region; Monitor read access ([REFERENCE](https://citrix.atlassian.net/wiki/spaces/PUBSEC/pages/1999241270)); the `.ps1` file, saved anywhere.
+**Prerequisites:** PowerShell 5.1 (built into Windows 10/11); network access to a Delivery Controller or the Citrix Cloud endpoint for your region; Monitor read access ([REFERENCE](https://github.com/shilllabs/CitrixUsageReport/blob/main/Reference.md)); the `.ps1` file, saved anywhere.
 
 1. **Execution policy** — a default client refuses to run any script, failing with a message naming `about_Execution_Policies`. That is normal and says nothing about this script.
 
@@ -70,13 +70,13 @@ If something is wrong, a message appears above the buttons and the dialog stays 
 
 # 3. What gets written, and what to send back
 
-Each run creates a timestamped folder. Which files appear depends on the toggles — the full list is in [README](https://citrix.atlassian.net/wiki/spaces/PUBSEC/pages/1999241260).
+Each run creates a timestamped folder. Which files appear depends on the toggles — the full list is in [README](https://github.com/shilllabs/CitrixUsageReport/blob/main/README.md).
 
 > **Send back everything except** `identity-map.csv` **and** `anonymization-salt.txt`**.** Those two stay with you. `consolidated-identity-map.csv` holds no names and is safe to send, though it is only useful to you — see [section 7](#7-checking-a-combined-number-yourself).
 
 `identity-map.csv` maps each `User-NNNN` pseudonym back to the account it replaced: `Pseudonym`, `UserKey`, `RealUserId`, `UserName`, `FullName`, `Upn`. `UserKey` is filled only when the run also produces a merge export. An account that appears in session data but has since been removed still gets a row, with the name columns blank.
 
-With anonymization off there is no map to hold back, and nothing is de-identified. Anonymization never covers machine names, delivery group names or published application names — see [REFERENCE](https://citrix.atlassian.net/wiki/spaces/PUBSEC/pages/1999241270).
+With anonymization off there is no map to hold back, and nothing is de-identified. Anonymization never covers machine names, delivery group names or published application names — see [REFERENCE](https://github.com/shilllabs/CitrixUsageReport/blob/main/Reference.md).
 
 ---
 
