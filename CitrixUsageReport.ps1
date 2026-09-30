@@ -1,8 +1,9 @@
 ﻿#requires -Version 5.1
 # ============================================================================
 #  Citrix Usage Report - GENERATED FILE, DO NOT EDIT DIRECTLY
-#  Built : 2026-08-24T19:09:39Z
-#  Source: https://github.com/shilllabs/CitrixUsageReport/
+#  Version: 1.11.1
+#  Built  : 2026-09-29T17:07:25Z
+#  Source : https://git.shillapps.com/shane/citrix-usage-report
 #  Edit the files under src/ and re-run build.ps1 instead.
 # ============================================================================
 
@@ -129,6 +130,20 @@
     warning that the run was performed unencrypted.
 
 .EXAMPLE
+    powershell -NoProfile -ExecutionPolicy Bypass -Command ".\CitrixUsageReport.ps1 -Environment CloudCommercial -CustomerId <yourCustomerId> -ClientId <yourServicePrincipalId> -ClientSecret (Read-Host 'Service principal secret' -AsSecureString) -NoGui -Days 30,60,90 -OutputPath C:\Reports"
+
+    Reports against Citrix Cloud. The customer ID and the service principal
+    (supplied as -ClientId and -ClientSecret) come from the Citrix Cloud
+    console under Identity and Access Management, API Access, Service
+    principals. Use CloudCommercial, CloudJapan or CloudGovernment.
+
+    The secret is read INLINE rather than into a variable first. A variable
+    written inside a double-quoted -Command argument is expanded by the shell
+    the command was typed into, before this process starts, so it arrives
+    empty and the run fails. -File cannot be used here at all: a SecureString
+    crosses that boundary as the literal text System.Security.SecureString.
+
+.EXAMPLE
     .\CitrixUsageReport.ps1 -DemoData -OutputPath C:\Temp
 
     Produces a sample report from synthetic data, with no Citrix environment.
@@ -172,7 +187,7 @@ param(
     # single string to an int by stripping the commas as thousands
     # separators (306090), which then fails ValidateRange. Kept as
     # unvalidated strings here and parsed with ConvertTo-DaysArray
-    # (src/90-Gui.ps1) inside Invoke-CitrixUsageAudit, the only place both
+    # (src/90-Gui.ps1) inside Invoke-CitrixUsageReport, the only place both
     # the real argv shape and that function are available together -- see
     # the note there for why the parsing cannot happen here instead.
     [string[]] $Days = @('30', '60', '90'),
@@ -186,8 +201,65 @@ param(
     [switch] $Anonymize,
     [switch] $ExportRawData,
     [switch] $DemoData,
-    [switch] $NoGui
+    [switch] $NoGui,
+
+    # Writes merge-export.json alongside the report: this site's contribution
+    # to a consolidated report covering several sites, or several dates. See
+    # docs/REFERENCE.md section 6.
+    [switch] $ExportForMerge,
+
+    # Where the anonymization salt lives. Every export intended for one
+    # consolidated report must use the same salt, so this file is the
+    # customer's to keep and to reuse. Created on first use.
+    [string] $SaltPath,
+
+    # A merge export that is not anonymized carries raw security identifiers.
+    # Legitimate, but it should be deliberate: this is the file that travels
+    # between sites and is kept for years.
+    [switch] $AllowUnanonymizedMergeExport,
+
+    # Consolidate several merge exports into one report instead of contacting
+    # a Citrix site. Accepts file paths, or directories to search for
+    # merge-export.json.
+    [string[]] $Merge,
+
+    # Also match people across directories by user principal name. Off by
+    # default: a name match is a weaker claim than a security-identifier
+    # match, and the same evidence is produced by one person holding accounts
+    # in two directories and by two different people who share a name.
+    [ValidateSet('None', 'Upn')]
+    [string] $CrossForestKey = 'None',
+
+    # Never bridge these user principal names, for an operator who has
+    # recognized a false merge and needs a smaller instrument than switching
+    # the bridge off entirely.
+    [string[]] $ExcludeBridgeUpn
 )
+
+# ---------------------------------------------------------------------------
+# Version stamp
+#
+# build.ps1 rewrites the two lines below from the VERSION file at the
+# repository root, so every distributed script names the exact iteration it
+# was built from. A customer sending back a report or a log therefore tells us
+# which build produced it without anyone having to remember.
+#
+# Running the sources directly -- which the test suite does -- leaves the
+# placeholders in place. That reports as a development build rather than
+# claiming a release number it has not been through the build for.
+# ---------------------------------------------------------------------------
+$script:ReportVersion = '1.11.1'
+$script:ReportBuiltUtc = '2026-09-29T17:07:25Z'
+
+# Where this script lives, captured while $PSCommandPath is still in scope.
+#
+# The background worker runs in a new runspace, which is a fresh session state
+# containing none of these functions. It gets them by dot-sourcing this same
+# file with CITRIXUSAGEREPORT_SUPPRESS_MAIN set, so the entry point at the
+# bottom does not fire. In the built single file this is that file; when
+# running from src/ it is only the header, which is why the worker takes an
+# explicit bootstrap path rather than assuming this one is enough.
+$script:ReportScriptPath = $PSCommandPath
 
 # endregion 00-Header.ps1
 
@@ -203,15 +275,20 @@ param(
 # ============================================================================
 
 # Literal secret values registered at runtime (client secrets, tokens).
-$script:AuditSecrets = New-Object System.Collections.Generic.List[string]
+$script:ReportSecrets = New-Object System.Collections.Generic.List[string]
 
-# Absolute path of the run log. Null until Initialize-AuditLog is called;
+# Absolute path of the run log. Null until Initialize-ReportLog is called;
 # logging before that point goes to the console only.
-$script:AuditLogPath = $null
+$script:ReportLogPath = $null
+
+# An optional second destination for log lines, used by the run panel so the
+# operator can watch the run without a console window. Null when nothing is
+# listening, which is every non-GUI run.
+$script:ReportLogSink = $null
 
 # Patterns that mask secret-shaped text even if the literal was never
 # registered - for example a token quoted inside an exception message.
-$script:AuditRedactionPatterns = @(
+$script:ReportRedactionPatterns = @(
     # Bearer / CwsAuth token values
     '(?i)(Bearer[=\s]+)([A-Za-z0-9\-\._~\+/]{16,}=*)',
     # Form-encoded client_secret
@@ -222,7 +299,7 @@ $script:AuditRedactionPatterns = @(
     '(?i)(Basic\s+)([A-Za-z0-9\+/]{16,}=*)'
 )
 
-function Register-AuditSecret {
+function Register-ReportSecret {
     <#
     .SYNOPSIS
         Registers a literal string that must never appear in log output.
@@ -236,8 +313,8 @@ function Register-AuditSecret {
 
     if ([string]::IsNullOrWhiteSpace($Secret)) { return }
     if ($Secret.Length -lt 4) { return }
-    if (-not $script:AuditSecrets.Contains($Secret)) {
-        $script:AuditSecrets.Add($Secret)
+    if (-not $script:ReportSecrets.Contains($Secret)) {
+        $script:ReportSecrets.Add($Secret)
     }
 }
 
@@ -255,13 +332,13 @@ function Get-RedactedText {
     $result = $Text
 
     # Registered literals first - the exact values we know are secret.
-    foreach ($secret in $script:AuditSecrets) {
+    foreach ($secret in $script:ReportSecrets) {
         $result = $result.Replace($secret, '***REDACTED***')
     }
 
     # Then shape-based patterns, preserving the identifying prefix so the log
     # still shows what kind of value was masked.
-    foreach ($pattern in $script:AuditRedactionPatterns) {
+    foreach ($pattern in $script:ReportRedactionPatterns) {
         $result = [regex]::Replace($result, $pattern, {
             param($m)
             if ($m.Groups.Count -ge 4 -and $m.Groups[3].Success) {
@@ -275,13 +352,40 @@ function Get-RedactedText {
     return $result
 }
 
-function Initialize-AuditLog {
+function Register-ReportLogSink {
+    <#
+    .SYNOPSIS
+        Registers a second destination for log lines, called with the
+        already-redacted text.
+    .DESCRIPTION
+        Invoked as & $Sink $Level $RedactedText. Only one sink at a time:
+        there is exactly one run panel, and a list would invite a leak by
+        making it less obvious who is watching.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][scriptblock] $Sink)
+
+    $script:ReportLogSink = $Sink
+}
+
+function Unregister-ReportLogSink {
+    <#
+    .SYNOPSIS
+        Removes the current sink. Safe to call when none is registered.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $script:ReportLogSink = $null
+}
+
+function Initialize-ReportLog {
     <#
     .SYNOPSIS
         Opens the run log file, creating its directory if necessary.
     .DESCRIPTION
-        Attempts to initialize the audit log file. On failure, leaves
-        $script:AuditLogPath as $null so that Write-AuditLog degrades
+        Attempts to initialize the run log file. On failure, leaves
+        $script:ReportLogPath as $null so that Write-ReportLog degrades
         to console-only logging rather than failing repeatedly.
     #>
     [CmdletBinding()]
@@ -305,25 +409,25 @@ function Initialize-AuditLog {
         Set-Content -Path $Path -Value $header -Encoding UTF8 -ErrorAction Stop
 
         # Only set the path on successful write
-        $script:AuditLogPath = $Path
+        $script:ReportLogPath = $Path
     } catch {
         Write-Host "WARNING: Could not initialize run log at '$Path': $($_.Exception.Message)" -ForegroundColor Yellow
-        # Leave $script:AuditLogPath as $null to degrade to console-only logging
+        # Leave $script:ReportLogPath as $null to degrade to console-only logging
     }
 }
 
-function Reset-AuditLogForTesting {
+function Reset-ReportLogForTesting {
     <#
     .SYNOPSIS
         Clears logging state. Used by the test suite only.
     #>
     [CmdletBinding()]
     param()
-    $script:AuditLogPath = $null
-    $script:AuditSecrets.Clear()
+    $script:ReportLogPath = $null
+    $script:ReportSecrets.Clear()
 }
 
-function Write-AuditLog {
+function Write-ReportLog {
     <#
     .SYNOPSIS
         Writes a redacted, timestamped message to the console and the log file.
@@ -348,11 +452,19 @@ function Write-AuditLog {
         'Error'   { Write-Host $safe -ForegroundColor Red }
     }
 
-    if ($script:AuditLogPath) {
+    # After redaction, never before: $safe is what the log file gets, and the
+    # panel must never be able to show more than the file does.
+    if ($script:ReportLogSink) {
+        # A failing sink is a broken window, not a broken run. Swallowed for
+        # the same reason a failing log write is.
+        try { & $script:ReportLogSink $Level $safe } catch { }
+    }
+
+    if ($script:ReportLogPath) {
         # Logging must never be the reason a run fails, so a write failure is
         # swallowed rather than propagated.
         try {
-            Add-Content -Path $script:AuditLogPath -Value $line -Encoding UTF8 -ErrorAction Stop
+            Add-Content -Path $script:ReportLogPath -Value $line -Encoding UTF8 -ErrorAction Stop
         } catch {
             Write-Verbose "Could not write to log file: $($_.Exception.Message)"
         }
@@ -360,6 +472,181 @@ function Write-AuditLog {
 }
 
 # endregion 10-Logging.ps1
+
+# ----------------------------------------------------------------------------
+# region 15-RunChannel.ps1
+# ----------------------------------------------------------------------------
+# ============================================================================
+#  Run channel
+#
+#  The report work runs in a background runspace so the dialog stays alive and
+#  repainting through a run that can last five hours. This file is how the two
+#  sides talk: a thread-safe queue of small immutable events going one way, and
+#  a cancellation flag going the other.
+#
+#  Deliberately free of any WinForms reference, so it can be tested without a
+#  message loop and without a desktop.
+# ============================================================================
+
+# The cancellation source for the run in flight, or $null between runs.
+#
+# Module-scoped rather than passed down through six analytics signatures: the
+# hot loops read it once per 2,048 sessions, and threading a parameter through
+# every caller and every existing test to serve that one read is churn with no
+# reader. This is the same cross-file $script: pattern 10-Logging.ps1 already
+# uses for $script:ReportLogPath.
+$script:ReportCancellationSource = $null
+
+function New-RunChannel {
+    <#
+    .SYNOPSIS
+        Creates the queue the worker publishes run events to.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Concurrent.ConcurrentQueue[object]])]
+    param()
+
+    New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+}
+
+function Publish-RunEvent {
+    <#
+    .SYNOPSIS
+        Enqueues one run event for the UI to pick up on its next tick.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $Channel,
+        [Parameter(Mandatory)][hashtable] $Event
+    )
+
+    $Channel.Enqueue($Event)
+}
+
+function Read-RunEvents {
+    <#
+    .SYNOPSIS
+        Drains every queued event, oldest first.
+    .DESCRIPTION
+        Returns an array rather than streaming, because the caller is a timer
+        tick that must update the UI in one pass and then let go of the thread.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([Parameter(Mandatory)] $Channel)
+
+    $drained = New-Object 'System.Collections.Generic.List[object]'
+    $item = $null
+    while ($Channel.TryDequeue([ref] $item)) { $drained.Add($item) }
+
+    # .ToArray(), never @(): wrapping a generic List in @() throws
+    # "Argument types do not match" on Windows PowerShell 5.1.
+    # Return with unary comma to preserve empty arrays (PowerShell unwraps
+    # them to $null otherwise).
+    , $drained.ToArray()
+}
+
+function Set-ReportCancellation {
+    <#
+    .SYNOPSIS
+        Registers the cancellation source for the run about to start.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Threading.CancellationTokenSource] $Source)
+
+    $script:ReportCancellationSource = $Source
+}
+
+function Clear-ReportCancellation {
+    <#
+    .SYNOPSIS
+        Forgets the current cancellation source, so a later run starts clean.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $script:ReportCancellationSource = $null
+}
+
+function Test-ReportCancellation {
+    <#
+    .SYNOPSIS
+        True when the operator has asked for the run to stop.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    if (-not $script:ReportCancellationSource) { return $false }
+    return [bool] $script:ReportCancellationSource.IsCancellationRequested
+}
+
+function Assert-NotCancelled {
+    <#
+    .SYNOPSIS
+        Throws if the run has been cancelled. Called at phase boundaries.
+    .DESCRIPTION
+        OperationCanceledException rather than a plain throw so the worker can
+        tell "the operator stopped this" apart from "this failed", and report
+        the two differently.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if (Test-ReportCancellation) {
+        throw (New-Object System.OperationCanceledException 'The run was canceled.')
+    }
+}
+
+function Get-RunPhaseList {
+    <#
+    .SYNOPSIS
+        The phases this configuration will actually work through, in order.
+    .DESCRIPTION
+        Shown in full before the run starts, so the operator can see what is
+        still to come rather than only what is happening. Pure: it reads the
+        config and nothing else, which is what makes the panel testable.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)][pscustomobject] $Config)
+
+    $phases = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($Config.MergePaths -and @($Config.MergePaths).Count -gt 0) {
+        # Consolidating contacts no Citrix site at all, so there is nothing to
+        # connect to and nothing to collect.
+        $phases.Add('Load exports')
+        $phases.Add('Match identities')
+    } elseif ($Config.DemoData) {
+        # DemoData, not UseDemoData. New-ReportConfig (src/20-Config.ps1)
+        # names the property DemoData, and Invoke-ReportRun branches on
+        # $Config.DemoData -- the original spelling here matched nothing a
+        # real config carries, so every demo run would have previewed
+        # Connect/Collect phases it was never going to perform and then left
+        # both stuck on Pending for the whole run. Only a hand-built config
+        # (which is all this function had been given until the dialog started
+        # calling it) could ever have satisfied the old name.
+        $phases.Add('Generate')
+    } else {
+        $phases.Add('Connect')
+        $phases.Add('Collect')
+    }
+
+    $phases.Add('Analyze')
+    $phases.Add('Render')
+
+    # Export covers every file written beyond the report itself. Anonymizing
+    # writes identity-map.csv even with raw export off, and a consolidation
+    # always writes consolidated-identity-map.csv -- so all three imply it.
+    $exports = $Config.ExportRawData -or $Config.ExportForMerge -or $Config.Anonymize -or
+               ($Config.MergePaths -and @($Config.MergePaths).Count -gt 0)
+    if ($exports) { $phases.Add('Export') }
+
+    return $phases.ToArray()
+}
+
+# endregion 15-RunChannel.ps1
 
 # ----------------------------------------------------------------------------
 # region 20-Config.ps1
@@ -486,7 +773,7 @@ function Resolve-CitrixEndpoint {
     }
 }
 
-function New-AuditConfig {
+function New-ReportConfig {
     <#
     .SYNOPSIS
         Builds the run configuration object used by every later stage.
@@ -506,6 +793,32 @@ function New-AuditConfig {
 
         [int[]] $Days = @(30, 60, 90),
         [Parameter(Mandatory)][string] $OutputPath,
+        # Building a report from existing merge exports rather than from a
+        # live site. No endpoint is resolved and no controller is required.
+        [switch] $ConsolidateOnly,
+        # The merge exports to consolidate, and how to match people across
+        # them. Carried on the config for the same reason ExportForMerge is:
+        # the consolidation used to read -CrossForestKey and -ExcludeBridgeUpn
+        # straight from the bound parameters at the point of use, which the
+        # dialog cannot reach at all -- so a dialog-driven consolidation could
+        # only ever run with the bridge off, whatever the operator chose.
+        [string[]] $MergePaths,
+        # A name match is weaker evidence than a security identifier match,
+        # and the same evidence is produced by one person holding accounts in
+        # two forests and by two different people who share a name. Off unless
+        # asked for, in the dialog and on the command line alike.
+        [switch] $UseUpnBridge,
+        [string[]] $ExcludeBridgeUpn,
+        # Also write merge-export.json: this site's contribution to a report
+        # covering several sites, or several dates. Carried on the config
+        # rather than read from the command line at the point of use, so that
+        # the dialog and a command line supply it the same way -- an earlier
+        # version read this from bound parameters while reading -Anonymize
+        # from the config, and an interactive run could arrive with one half
+        # of the decision from each place and fail.
+        [switch] $ExportForMerge,
+        [AllowEmptyString()][string] $SaltPath,
+        [switch] $AllowUnanonymizedMergeExport,
 
         [int] $BusinessHourStart = 8,
         [int] $BusinessHourEnd = 18,
@@ -520,6 +833,11 @@ function New-AuditConfig {
         [switch] $DemoData
     )
 
+    $mergeList = @($MergePaths | Where-Object { $_ })
+    # Either spelling means the same thing. -ConsolidateOnly stays accepted so
+    # a caller can validate a consolidation config before it has paths.
+    $consolidating = [bool] $ConsolidateOnly -or ($mergeList.Count -gt 0)
+
     $windows = @($Days | Sort-Object -Unique)
     if (-not $windows) { $windows = @(30, 60, 90) }
 
@@ -528,7 +846,19 @@ function New-AuditConfig {
     # instant. Recomputing "now" per call would make results subtly inconsistent.
     $nowUtc = [DateTime]::UtcNow
 
-    $endpoint = if ($DemoData) {
+    $endpoint = if ($consolidating) {
+        # Consolidating existing exports contacts no Citrix site, so there is
+        # no endpoint to resolve and no Delivery Controller to demand. Kept
+        # distinct from DemoData because the data is real: a consolidated
+        # report must not carry the demo watermark.
+        [pscustomobject]@{
+            ODataBase = 'merge://consolidated'
+            TokenBase = $null
+            IsCloud   = $false
+            IsHttp    = $false
+            EnvironmentLabel = 'Consolidated from merge exports'
+        }
+    } elseif ($DemoData) {
         [pscustomobject]@{
             ODataBase = 'demo://synthetic'
             TokenBase = $null
@@ -542,6 +872,13 @@ function New-AuditConfig {
 
     [pscustomobject]@{
         Environment           = $Environment
+        # Building from existing exports rather than a live site. The
+        # validator reads this: nothing is contacted, so neither a
+        # controller nor cloud credentials are required.
+        ConsolidateOnly       = $consolidating
+        MergePaths            = $mergeList
+        UseUpnBridge          = [bool] $UseUpnBridge
+        ExcludeBridgeUpn      = @($ExcludeBridgeUpn | Where-Object { $_ })
         EnvironmentLabel      = $endpoint.EnvironmentLabel
         ODataBase             = $endpoint.ODataBase
         TokenBase             = $endpoint.TokenBase
@@ -574,12 +911,15 @@ function New-AuditConfig {
         IncludeClientDevices  = [bool] $IncludeClientDevices
         IncludeTrend          = [bool] $IncludeTrend
         Anonymize             = [bool] $Anonymize
+        ExportForMerge        = [bool] $ExportForMerge
+        SaltPath              = $SaltPath
+        AllowUnanonymizedMergeExport = [bool] $AllowUnanonymizedMergeExport
         ExportRawData         = [bool] $ExportRawData
         DemoData              = [bool] $DemoData
     }
 }
 
-function Test-AuditConfig {
+function Test-ReportConfig {
     <#
     .SYNOPSIS
         Validates a configuration, throwing a message aimed at the person
@@ -589,6 +929,12 @@ function Test-AuditConfig {
     param([Parameter(Mandatory)][pscustomobject] $Config)
 
     if ($Config.DemoData) { return }
+    # Consolidating existing exports contacts nothing, so there is no
+    # endpoint to reach and no credential to demand. Checked here as
+    # well as in Resolve-CitrixEndpoint because this validator is a
+    # second, independent gate: without this it would reject a
+    # perfectly valid consolidation run for a missing controller.
+    if ($Config.PSObject.Properties['ConsolidateOnly'] -and $Config.ConsolidateOnly) { return }
 
     if ($Config.IsCloud) {
         if ([string]::IsNullOrWhiteSpace($Config.CustomerId)) {
@@ -675,13 +1021,13 @@ function Request-CitrixCloudToken {
     # (+ / = & %, routine in generated API secrets), so the encoded form must
     # be registered too - otherwise it can reach a log line verbatim with no
     # client_secret= prefix in front of it for the shape-based pattern to catch.
-    Register-AuditSecret -Secret $secret
-    Register-AuditSecret -Secret ([uri]::EscapeDataString($secret))
+    Register-ReportSecret -Secret $secret
+    Register-ReportSecret -Secret ([uri]::EscapeDataString($secret))
 
     $body = 'grant_type=client_credentials&client_id={0}&client_secret={1}' -f `
         [uri]::EscapeDataString($Config.ClientId), [uri]::EscapeDataString($secret)
 
-    Write-AuditLog -Level Debug -Message "Requesting Citrix Cloud token from $tokenUrl"
+    Write-ReportLog -Level Debug -Message "Requesting Citrix Cloud token from $tokenUrl"
 
     try {
         $response = Invoke-RestMethod -Uri $tokenUrl -Method Post -Body $body `
@@ -702,7 +1048,7 @@ function Request-CitrixCloudToken {
         throw "The token endpoint $tokenUrl returned no access_token."
     }
 
-    Register-AuditSecret -Secret $response.access_token
+    Register-ReportSecret -Secret $response.access_token
 
     $lifetime = 3600
     if ($response.expires_in) { $lifetime = [int] $response.expires_in }
@@ -711,7 +1057,7 @@ function Request-CitrixCloudToken {
     # can fail mid-pull.
     $expires = [datetime]::UtcNow.AddSeconds($lifetime - $script:TokenRefreshMarginSeconds)
 
-    Write-AuditLog -Level Debug -Message "Token acquired; scheduled for refresh at $($expires.ToString('u'))."
+    Write-ReportLog -Level Debug -Message "Token acquired; scheduled for refresh at $($expires.ToString('u'))."
 
     [pscustomobject]@{ AccessToken = $response.access_token; ExpiresUtc = $expires }
 }
@@ -764,7 +1110,7 @@ function New-CitrixAuthContext {
         if ($this.IsCloud) {
             # Refresh proactively so a long pull never fails on an expired token.
             if ([datetime]::UtcNow -ge $this.TokenExpiresUtc) {
-                Write-AuditLog -Level Debug -Message 'Bearer token near expiry; refreshing.'
+                Write-ReportLog -Level Debug -Message 'Bearer token near expiry; refreshing.'
                 $this.Refresh()
             }
             $headers['Authorization'] = "CwsAuth Bearer=$($this.AccessToken)"
@@ -816,7 +1162,7 @@ function Get-AuthRequestParameters {
 $script:ODataRetryableStatus = @(408, 429, 500, 502, 503, 504)
 
 # Records every fetch that came back knowingly incomplete. Truncation used to
-# be written to audit.log and nowhere else, so an under-counted device or
+# be written to usage-report.log and nowhere else, so an under-counted device or
 # application figure reached the customer's report looking exactly like a
 # complete one -- the same silent-undercount failure the retention banner
 # exists to prevent, applied to a different entity. The log is script-scoped
@@ -925,6 +1271,217 @@ function Get-ODataStatusCode {
     return 0
 }
 
+function Initialize-TlsProtocol {
+    <#
+    .SYNOPSIS
+        Ensures TLS 1.2 is enabled for this process before any HTTPS call.
+    .DESCRIPTION
+        Windows PowerShell 5.1 inherits whatever .NET Framework defaults to,
+        and on an older or hardened machine that can still be TLS 1.0. Citrix
+        Cloud refuses it. The failure that produces is a connection error that
+        says nothing about protocols, so it reads as a credential or network
+        problem and sends the reader looking in the wrong place entirely.
+
+        ADDITIVE, deliberately. Older protocols are left enabled rather than
+        cleared: an on-premises Monitor endpoint behind an old load balancer
+        may still only speak TLS 1.0, and turning that off here would break a
+        site that works today in order to harden a connection the customer
+        already chose to make. The goal is to make sure TLS 1.2 is available,
+        not to police what else is.
+
+        TLS 1.3 is added only where the runtime knows the name -- the enum
+        member does not exist before .NET Framework 4.8.
+
+        Never throws. A machine with a locked-down policy that refuses the
+        assignment still gets to attempt the run.
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        $current = [Net.ServicePointManager]::SecurityProtocol
+        $desired = $current -bor [Net.SecurityProtocolType]::Tls12
+
+        if ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') {
+            $desired = $desired -bor [Net.SecurityProtocolType]::Tls13
+        }
+
+        if ($desired -ne $current) {
+            [Net.ServicePointManager]::SecurityProtocol = $desired
+            Write-ReportLog -Level Debug -Message "Enabled TLS 1.2 for this process (was: $current, now: $([Net.ServicePointManager]::SecurityProtocol))."
+        }
+    } catch {
+        Write-ReportLog -Level Warn -Message "Could not enable TLS 1.2 for this process: $($_.Exception.Message). If this machine defaults to an older protocol, an HTTPS connection to Citrix Cloud may be refused."
+    }
+}
+
+function Get-ODataServerMessage {
+    <#
+    .SYNOPSIS
+        Pulls the server's own explanation out of a failed request.
+    .DESCRIPTION
+        When Citrix rejects a request its response body usually carries a
+        plain-English reason, and that reason is routinely more useful than
+        anything this script can infer from the status code alone. A live
+        review run received "Access denied to query Monitor objects: Invalid
+        Customer" -- which identified the real problem precisely, the customer
+        ID being valid but having no Monitor site behind it -- while the script
+        reported only its own generic "check the credentials" text.
+
+        OData errors are {"error":{"code":..,"message":..}}, so that shape is
+        unwrapped when present; anything else is returned as trimmed text.
+
+        Returns $null when there is no usable message, so callers can append
+        it conditionally rather than printing an empty quotation.
+    .OUTPUTS
+        A single-line [string], or $null.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] $ErrorRecord)
+
+    # Capped because this text ends up in a thrown message, the run log and
+    # potentially the report. A server that returns an HTML error page would
+    # otherwise paste the whole page into all three.
+    $maxLength = 400
+
+    try {
+        $body = $null
+
+        # Windows PowerShell usually pre-reads the error body into
+        # ErrorDetails. When it has, the stream below is already consumed, so
+        # this has to be tried first rather than as a fallback.
+        if ($ErrorRecord.PSObject.Properties['ErrorDetails'] -and $ErrorRecord.ErrorDetails -and
+            -not [string]::IsNullOrWhiteSpace($ErrorRecord.ErrorDetails.Message)) {
+            $body = $ErrorRecord.ErrorDetails.Message
+        }
+
+        if (-not $body) {
+            $response = $null
+            $ex = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+            $depth = 0
+            while ($ex -and $depth -lt 32) {
+                if ($ex.PSObject.Properties['Response'] -and $ex.Response) { $response = $ex.Response; break }
+                $ex = $ex.InnerException
+                $depth++
+            }
+
+            if ($response -and $response.PSObject.Methods['GetResponseStream']) {
+                $stream = $response.GetResponseStream()
+                if ($stream) {
+                    $reader = New-Object System.IO.StreamReader($stream)
+                    try { $body = $reader.ReadToEnd() } finally { $reader.Dispose() }
+                }
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($body)) { return $null }
+
+        # OData's error envelope. Parsed rather than regexed so a message
+        # containing braces or quotes survives intact.
+        $message = $body
+        try {
+            $parsed = $body | ConvertFrom-Json
+            if ($parsed.PSObject.Properties['error'] -and $parsed.error) {
+                if ($parsed.error.PSObject.Properties['message'] -and $parsed.error.message) {
+                    # Some services nest it one deeper as {"message":{"value":..}}.
+                    $message = if ($parsed.error.message -is [string]) {
+                        $parsed.error.message
+                    } elseif ($parsed.error.message.PSObject.Properties['value']) {
+                        $parsed.error.message.value
+                    } else { $body }
+                }
+            } elseif ($parsed.PSObject.Properties['message'] -and $parsed.message -is [string]) {
+                $message = $parsed.message
+            }
+        } catch {
+            # Not JSON. The raw body is still better than nothing.
+        }
+
+        # Collapsed to one line: this is appended to a message that may be
+        # written to a single-line log record.
+        $message = ($message -replace '\s+', ' ').Trim()
+        if ([string]::IsNullOrWhiteSpace($message)) { return $null }
+        if ($message.Length -gt $maxLength) { $message = $message.Substring(0, $maxLength) + '...' }
+
+        return $message
+    } catch {
+        # This runs inside error handling. It must never be the reason a run
+        # fails, so any problem here simply means no server detail is added.
+        return $null
+    }
+}
+
+function Get-ODataRetryAfterSeconds {
+    <#
+    .SYNOPSIS
+        Reads the server's own "wait this long" hint from a throttled response.
+    .DESCRIPTION
+        A service that rate-limits may send Retry-After, which is a better
+        wait than any back-off guessed from this side. Honoring it makes this
+        a better-behaved client and reduces the chance of being throttled
+        harder on a busy tenant.
+
+        CLAMPED, and that matters: the value is chosen by the server. A wrong
+        or hostile one -- Retry-After: 86400 -- would otherwise park a
+        customer's run for a day with no way to tell it apart from a hang. The
+        cap keeps the hint useful without handing the remote end control of
+        how long this process sleeps.
+
+        The header is defined as either a number of seconds or an HTTP date;
+        both shapes are accepted.
+
+        Returns $null when there is no usable hint, which is the normal case.
+    .OUTPUTS
+        An [int] number of seconds, or $null.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $ErrorRecord,
+        [int] $MaxSeconds = 120
+    )
+
+    try {
+        $response = $null
+        $ex = if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) { $ErrorRecord.Exception } else { $ErrorRecord }
+        $depth = 0
+        while ($ex -and $depth -lt 32) {
+            if ($ex.PSObject.Properties['Response'] -and $ex.Response) { $response = $ex.Response; break }
+            $ex = $ex.InnerException
+            $depth++
+        }
+        if (-not $response -or -not $response.PSObject.Properties['Headers'] -or -not $response.Headers) { return $null }
+
+        $raw = $response.Headers['Retry-After']
+        if ($raw -is [array]) { $raw = @($raw | Where-Object { $_ } | Select-Object -First 1)[0] }
+        if ([string]::IsNullOrWhiteSpace([string]$raw)) { return $null }
+        $raw = ([string]$raw).Trim()
+
+        $seconds = $null
+        $asInt = 0
+        if ([int]::TryParse($raw, [ref]$asInt)) {
+            $seconds = $asInt
+        } else {
+            # HTTP-date form. Measured against our own clock, which is the
+            # only one available here.
+            try {
+                $when = ([DateTimeOffset]::Parse($raw, [System.Globalization.CultureInfo]::InvariantCulture)).UtcDateTime
+                $seconds = [int][math]::Ceiling(($when - [DateTime]::UtcNow).TotalSeconds)
+            } catch {
+                return $null
+            }
+        }
+
+        if ($null -eq $seconds -or $seconds -le 0) { return $null }
+        if ($seconds -gt $MaxSeconds) {
+            Write-ReportLog -Level Warn -Message "The server asked to wait $seconds s before retrying; capping that at $MaxSeconds s so the run cannot be stalled indefinitely by a single header."
+            return $MaxSeconds
+        }
+        return $seconds
+    } catch {
+        return $null
+    }
+}
+
 function Test-CitrixTlsTrustFailure {
     <#
     .SYNOPSIS
@@ -983,7 +1540,7 @@ function New-CitrixTlsTrustMessage {
 
     $targetHost = try { ([uri] $Url).Host } catch { $Url }
 
-    "TLS certificate trust failure connecting to $targetHost. This machine does not trust the certificate presented by $targetHost. The usual cause is a certificate issued by the organisation's own internal Certificate Authority, whose root certificate is not present in this machine's trust store -- this is common when this tool is run from a machine outside the Citrix estate. Options: run this tool from a domain-joined machine inside the estate (which usually already trusts the internal CA), or install the issuing CA's root certificate on this machine. This tool does not offer a way to bypass certificate validation."
+    "TLS certificate trust failure connecting to $targetHost. This machine does not trust the certificate presented by $targetHost. The usual cause is a certificate issued by the organization's own internal Certificate Authority, whose root certificate is not present in this machine's trust store -- this is common when this tool is run from a machine outside the Citrix estate. Options: run this tool from a domain-joined machine inside the estate (which usually already trusts the internal CA), or install the issuing CA's root certificate on this machine. This tool does not offer a way to bypass certificate validation."
 }
 
 function Test-CitrixDirectorHost {
@@ -1074,7 +1631,13 @@ function Build-ODataUrl {
     $url = "{0}/{1}" -f $Base.TrimEnd('/'), $Entity
     $parts = @()
 
-    if ($Select)  { $parts += '$select=' + ($Select -join ',') }
+    # Each field name is escaped individually and then joined with a literal
+    # comma. Escaping the joined string instead would turn the separator into
+    # %2C, and in $select the comma is structure rather than data -- whether a
+    # given server decodes before splitting is not something worth discovering
+    # in a customer's environment. This gives the same consistency with
+    # $filter and $orderby below without touching the protocol.
+    if ($Select)  { $parts += '$select=' + ((@($Select) | ForEach-Object { [uri]::EscapeDataString($_) }) -join ',') }
     if ($Filter)  { $parts += '$filter=' + [uri]::EscapeDataString($Filter) }
     if ($OrderBy) { $parts += '$orderby=' + [uri]::EscapeDataString($OrderBy) }
     if ($Top -gt 0) { $parts += '$top=' + $Top }
@@ -1123,12 +1686,19 @@ function Invoke-CitrixODataQuery {
     # working" until they kill the script.
     $seenUrls = New-Object 'System.Collections.Generic.HashSet[string]'
 
-    Write-AuditLog -Level Debug -Message "OData GET $Entity"
+    Write-ReportLog -Level Debug -Message "OData GET $Entity"
 
     while ($url) {
 
+        # One page can be tens of thousands of rows over a slow link, so
+        # checking only before or after the whole entity set has been walked
+        # would leave Cancel waiting on however many pages remain. Checking
+        # here, between pages, is what makes Cancel land promptly regardless
+        # of how large the entity set turns out to be.
+        Assert-NotCancelled
+
         if ($CancellationCheck -and (& $CancellationCheck)) {
-            Write-AuditLog -Level Warn -Message "Cancelled while fetching $Entity after $($results.Count) records."
+            Write-ReportLog -Level Warn -Message "Canceled while fetching $Entity after $($results.Count) records."
             break
         }
 
@@ -1148,11 +1718,20 @@ function Invoke-CitrixODataQuery {
             } catch {
                 $status = Get-ODataStatusCode -ErrorRecord $_
 
+                # The server's own explanation, read once per failure and
+                # appended to whichever message is raised below. It is
+                # routinely more specific than anything inferable from the
+                # status code -- a live review run saw "Access denied to query
+                # Monitor objects: Invalid Customer", which named the real
+                # problem, discarded in favor of a generic credentials hint.
+                $serverSaid = Get-ODataServerMessage -ErrorRecord $_
+                $serverDetail = if ($serverSaid) { " Citrix said: ""$serverSaid""" } else { '' }
+
                 # A 401 usually means an expired cloud token. Refresh once and
                 # retry; a second 401 is a real credential problem.
                 if ($status -eq 401 -and -not $refreshedOn401) {
                     $refreshedOn401 = $true
-                    Write-AuditLog -Level Debug -Message 'Received HTTP 401; refreshing credentials and retrying.'
+                    Write-ReportLog -Level Debug -Message 'Received HTTP 401; refreshing credentials and retrying.'
                     $AuthContext.Refresh()
                     continue
                 }
@@ -1167,13 +1746,13 @@ function Invoke-CitrixODataQuery {
                     # so, and names the three places a different account can
                     # be supplied instead.
                     if (-not $AuthContext.IsCloud -and $AuthContext.UseDefaultCredentials) {
-                        throw "Authentication failed (HTTP 401) against $($AuthContext.ODataBase). This run authenticated as the signed-in user, which is the default. Check that account may read Citrix Monitor data, or supply a different account -- in the dialog, at the console prompt, or with -Credential."
+                        throw "Authentication failed (HTTP 401) against $($AuthContext.ODataBase). This run authenticated as the signed-in user, which is the default. Check that account may read Citrix Monitor data, or supply a different account -- in the dialog, at the console prompt, or with -Credential.$serverDetail"
                     }
-                    throw "Authentication failed (HTTP 401) against $($AuthContext.ODataBase). Check the credentials supplied and that the account may read Citrix Monitor data."
+                    throw "Authentication failed (HTTP 401) against $($AuthContext.ODataBase). Check the credentials supplied and that the account may read Citrix Monitor data.$serverDetail"
                 }
 
                 if ($status -eq 403) {
-                    throw "Access denied (HTTP 403) against $($AuthContext.ODataBase). The account authenticated successfully but lacks permission to read Citrix Monitor data. On-premises this needs a Citrix Director or Monitor read role; in Citrix Cloud the API client needs a read scope."
+                    throw "Access denied (HTTP 403) against $($AuthContext.ODataBase). The account authenticated successfully but lacks permission to read Citrix Monitor data. On-premises this needs a Delegated Administration role with read access to the site -- the built-in Read Only Administrator is the least-privileged one that includes it; in Citrix Cloud the API client needs a read scope.$serverDetail"
                 }
 
                 if ($status -eq 404) {
@@ -1200,13 +1779,26 @@ function Invoke-CitrixODataQuery {
                     # without string-matching the message. The message text is
                     # unchanged.
                     throw (New-ODataHttpError -StatusCode $status `
-                        -Message "Query for $Entity failed after $attempt attempt(s): $detail")
+                        -Message "Query for $Entity failed after $attempt attempt(s): $detail.$serverDetail")
                 }
 
                 # Exponential backoff, capped so a long outage does not stall
                 # the run for minutes at a time.
                 $delay = [math]::Min([math]::Pow(2, $attempt), 30)
-                Write-AuditLog -Level Warn -Message "HTTP $status fetching $Entity; retrying in $delay s (attempt $attempt of $MaxAttempts)."
+
+                # A server that sends Retry-After has told us what it actually
+                # wants, which beats a number guessed from this side. Taken
+                # only when it asks for LONGER than our own back-off: retrying
+                # sooner than the server asked is the behavior that gets a
+                # client throttled harder, while waiting longer than it asked
+                # costs a customer time for nothing.
+                $retryAfter = Get-ODataRetryAfterSeconds -ErrorRecord $_
+                if ($retryAfter -and $retryAfter -gt $delay) {
+                    Write-ReportLog -Level Debug -Message "Honoring the server's Retry-After hint of $retryAfter s instead of the $delay s back-off."
+                    $delay = $retryAfter
+                }
+
+                Write-ReportLog -Level Warn -Message "HTTP $status fetching $Entity; retrying in $delay s (attempt $attempt of $MaxAttempts).$serverDetail"
                 Start-Sleep -Seconds $delay
             }
         }
@@ -1218,14 +1810,14 @@ function Invoke-CitrixODataQuery {
         if ($ProgressAction) { & $ProgressAction $Entity $results.Count }
 
         if ($MaxRecords -gt 0 -and $results.Count -ge $MaxRecords) {
-            Write-AuditLog -Level Warn -Message "Reached the $MaxRecords record cap for $Entity; results are truncated."
+            Write-ReportLog -Level Warn -Message "Reached the $MaxRecords record cap for $Entity; results are truncated."
             Add-ODataFetchWarning -Entity $Entity -Reason 'RecordCap' -RecordCount $results.Count `
                 -Message "Only the first $($results.Count) $Entity record(s) were read before the record cap was reached, and pages do not arrive in time order, so the records that were dropped are an arbitrary subset."
             break
         }
 
         if ($page -ge $MaxPages) {
-            Write-AuditLog -Level Warn -Message "Reached the maximum of $MaxPages page(s) fetching $Entity without the server signalling completion; stopping to avoid an unbounded run. Results may be incomplete."
+            Write-ReportLog -Level Warn -Message "Reached the maximum of $MaxPages page(s) fetching $Entity without the server signalling completion; stopping to avoid an unbounded run. Results may be incomplete."
             Add-ODataFetchWarning -Entity $Entity -Reason 'PageCap' -RecordCount $results.Count `
                 -Message "The server was still returning $Entity pages after $MaxPages page(s) ($($results.Count) record(s)), so the fetch was stopped. Pages do not arrive in time order, so the records that were dropped are an arbitrary subset."
             break
@@ -1240,7 +1832,7 @@ function Invoke-CitrixODataQuery {
             # A server returning a non-advancing nextLink would otherwise loop
             # forever. Truncation must never be silent, so this is a warning,
             # not a quiet stop.
-            Write-AuditLog -Level Warn -Message "The server returned a repeating pagination link while fetching $Entity; stopping to avoid an infinite loop. Results may be incomplete."
+            Write-ReportLog -Level Warn -Message "The server returned a repeating pagination link while fetching $Entity; stopping to avoid an infinite loop. Results may be incomplete."
             Add-ODataFetchWarning -Entity $Entity -Reason 'RepeatingPageLink' -RecordCount $results.Count `
                 -Message "The server returned a repeating pagination link while fetching $Entity, so the fetch was stopped after $($results.Count) record(s) to avoid an infinite loop."
             $url = $null
@@ -1249,7 +1841,7 @@ function Invoke-CitrixODataQuery {
         }
     }
 
-    Write-AuditLog -Level Debug -Message "$Entity : $($results.Count) record(s) over $page page(s)."
+    Write-ReportLog -Level Debug -Message "$Entity : $($results.Count) record(s) over $page page(s)."
     # Plain return, not a unary-comma-wrapped one: `@(Invoke-CitrixODataQuery
     # ...)` at the call site (see 50-DataModel.ps1) is the codebase's
     # standard way to get a reliably correct count for zero, one, or many
@@ -1270,7 +1862,7 @@ function Invoke-CitrixODataQuery {
 # ============================================================================
 #  Data model
 #
-#  Fetches Citrix Monitor entities and projects them into slim, normalised
+#  Fetches Citrix Monitor entities and projects them into slim, normalized
 #  objects. Projection happens as each page arrives so that a large site does
 #  not accumulate raw JSON in memory.
 #
@@ -1284,7 +1876,7 @@ function ConvertTo-UtcDateTime {
         Parses an OData date string into a UTC DateTime, or $null.
     .DESCRIPTION
         The Monitor API returns timestamps in several ISO-8601 shapes depending
-        on version and field. Round-trip parsing normalises all of them, and a
+        on version and field. Round-trip parsing normalizes all of them, and a
         null or empty value maps to $null rather than to DateTime.MinValue,
         because "no end date" means the session is still running.
     #>
@@ -1312,7 +1904,7 @@ function Get-SessionOverlapFilter {
         Builds the OData filter selecting sessions that overlap a window.
     .DESCRIPTION
         Overlap, not start date. A session that began before the window still
-        consumes a licence inside it, and persistent desktops routinely run for
+        consumes a license inside it, and persistent desktops routinely run for
         weeks. Filtering on StartDate alone would undercount every site that
         uses static desktops.
     #>
@@ -1328,15 +1920,15 @@ function Get-SessionOverlapFilter {
     return "(EndDate eq null or EndDate gt $s) and StartDate lt $e"
 }
 
-function Invoke-AuditPreflight {
+function Invoke-ReportPreflight {
     <#
     .SYNOPSIS
         Verifies reachability and discovers how much history actually exists.
     .DESCRIPTION
-        Citrix grooms raw session data on a schedule set by the site's licence
+        Citrix grooms raw session data on a schedule set by the site's license
         edition: 90 days on Premium, 31 on Advanced, 7 otherwise. Any window
         wider than the real limit produces an under-count that is invisible in
-        the output unless it is labelled here.
+        the output unless it is labeled here.
 
         Retention is measured from the oldest ENDED session, because grooming
         only ever removes ended sessions. A persistent desktop that has been
@@ -1356,7 +1948,7 @@ function Invoke-AuditPreflight {
           recent simply because nothing ended earlier -- not because anything
           was groomed. The figure is still the honest answer to "how far back
           does the data we hold actually go", which is what the windows are
-          analysed against, so the banner wording names both possible causes
+          analyzed against, so the banner wording names both possible causes
           instead of asserting grooming.
         * A site with NO ended sessions in retention gives no grooming signal
           at all. Rather than report zero (which would flag every window on a
@@ -1370,7 +1962,7 @@ function Invoke-AuditPreflight {
         [Parameter(Mandatory)][pscustomobject] $Config
     )
 
-    Write-AuditLog -Level Info -Message 'Checking connectivity and available history...'
+    Write-ReportLog -Level Info -Message 'Checking connectivity and available history...'
 
     # @() defensively re-wraps each result: PowerShell collapses a single-
     # element (or empty) array to a scalar (or $null) as it crosses a
@@ -1423,14 +2015,14 @@ function Invoke-AuditPreflight {
     $truncated = @($Config.Days | Where-Object { $_ -gt $availableDays })
 
     if ($basis -eq 'OldestSessionStart') {
-        Write-AuditLog -Level Warn -Message 'No completed (ended) sessions were returned, so how much history Citrix still retains could not be confirmed. Falling back to the oldest session start date, which may overstate retention if every older session has already been groomed.'
+        Write-ReportLog -Level Warn -Message 'No completed (ended) sessions were returned, so how much history Citrix still retains could not be confirmed. Falling back to the oldest session start date, which may overstate retention if every older session has already been groomed.'
     } elseif ($basis -eq 'NoSessions') {
-        Write-AuditLog -Level Warn -Message 'No sessions at all were returned by the history probe. Either the site has had no activity, or the account cannot read Monitor session data.'
+        Write-ReportLog -Level Warn -Message 'No sessions at all were returned by the history probe. Either the site has had no activity, or the account cannot read Monitor session data.'
     }
 
     if ($truncated.Count -gt 0) {
-        Write-AuditLog -Level Warn -Message ("Only {0} day(s) of session history are available on this site. These windows cannot be fully covered: {1}. Their figures are lower bounds, not true counts." -f $availableDays, ($truncated -join ', '))
-        Write-AuditLog -Level Warn -Message 'Citrix grooms raw session data at 90 days on Premium, 31 on Advanced, and 7 on other editions. Increasing retention requires a Premium licence and a Set-MonitorConfiguration change. (History can also be short simply because the site had no activity further back.)'
+        Write-ReportLog -Level Warn -Message ("Only {0} day(s) of session history are available on this site. These windows cannot be fully covered: {1}. Their figures are lower bounds, not true counts." -f $availableDays, ($truncated -join ', '))
+        Write-ReportLog -Level Warn -Message 'Citrix grooms raw session data at 90 days on Premium, 31 on Advanced, and 7 on other editions. Increasing retention requires a Premium license and a Set-MonitorConfiguration change. (History can also be short simply because the site had no activity further back.)'
     } elseif ($basis -ne 'OldestEndedSession') {
         # Every *requested* window nominally fits inside $availableDays, but
         # $availableDays itself was never confirmed against Citrix's grooming
@@ -1442,13 +2034,13 @@ function Invoke-AuditPreflight {
         # site is a real, unremarkable example) would otherwise get a report
         # with no banner and no caveat, stating coverage that was never
         # actually established.
-        Write-AuditLog -Level Warn -Message "$availableDays day(s) of session history appear to be available, but this could not be confirmed: no completed (ended) session was found to measure retention from. Every requested window nominally fits inside that figure, but treat it -- and everything derived from it -- as a lower bound, not a confirmed true count."
+        Write-ReportLog -Level Warn -Message "$availableDays day(s) of session history appear to be available, but this could not be confirmed: no completed (ended) session was found to measure retention from. Every requested window nominally fits inside that figure, but treat it -- and everything derived from it -- as a lower bound, not a confirmed true count."
     } else {
-        Write-AuditLog -Level Success -Message "$availableDays day(s) of session history are available; every requested window is fully covered."
+        Write-ReportLog -Level Success -Message "$availableDays day(s) of session history are available; every requested window is fully covered."
     }
 
     if ($oldestStart -and $oldestEnd -and $oldestStart -lt $historyStart) {
-        Write-AuditLog -Level Info -Message ("The oldest session on this site started {0:yyyy-MM-dd} and is still running; retention is measured from the oldest ENDED session ({1:yyyy-MM-dd}) because open sessions are never groomed." -f $oldestStart, $oldestEnd)
+        Write-ReportLog -Level Info -Message ("The oldest session on this site started {0:yyyy-MM-dd} and is still running; retention is measured from the oldest ENDED session ({1:yyyy-MM-dd}) because open sessions are never groomed." -f $oldestStart, $oldestEnd)
     }
 
     [pscustomobject]@{
@@ -1563,16 +2155,19 @@ function Get-CitrixWindowedRecords {
         falling back to an unbounded fetch if the site rejects the filter.
     .DESCRIPTION
         The date field these entities carry is NOT StartDate/EndDate as on
-        Sessions, and it has varied across Monitor Service versions. This
-        project has never been run against a live Citrix site, so the field
-        names used by the caller are the best available reading of the schema
-        rather than something verified in production.
+        Sessions, and it has varied across Monitor Service versions.
+
+        Connections.EstablishmentDate has since been confirmed present, and
+        this filter confirmed working, against a live site -- see
+        docs/REFERENCE.md section 7. What has NOT been exercised live is the rejection
+        path below: no site encountered so far refuses the filter, so the
+        fallback remains covered by the test suite alone.
 
         A wrong field name in a filter is an HTTP 400, which would otherwise
-        turn a working (if wasteful) fetch into a failed audit. So a 400 --
-        and only a 400 -- degrades to the previous unfiltered behaviour, logs
+        turn a working (if wasteful) fetch into a failed run. So a 400 --
+        and only a 400 -- degrades to the previous unfiltered behavior, logs
         loudly, and records a fetch warning that reaches the REPORT, not just
-        audit.log. That way the bound is taken wherever the site supports it,
+        usage-report.log. That way the bound is taken wherever the site supports it,
         and a site that does not support it behaves exactly as it did before
         with the risk stated on the face of the output.
     #>
@@ -1597,7 +2192,7 @@ function Get-CitrixWindowedRecords {
     } catch {
         if ((Get-ODataStatusCode -ErrorRecord $_) -ne 400) { throw }
 
-        Write-AuditLog -Level Warn -Message "This site rejected the date filter used to limit the $Entity fetch to the reporting window ($Filter). Falling back to fetching all retained $Entity records, which is slower and, on a very large site, can hit the paging cap."
+        Write-ReportLog -Level Warn -Message "This site rejected the date filter used to limit the $Entity fetch to the reporting window ($Filter). Falling back to fetching all retained $Entity records, which is slower and, on a very large site, can hit the paging cap."
         Add-ODataFetchWarning -Entity $Entity -Reason 'UnboundedFetch' `
             -Message "$Entity could not be limited to the reporting period because this site rejected the date filter, so every retained $Entity record was requested instead. The figures derived from it are still correct unless a paging cap warning also appears."
 
@@ -1628,18 +2223,22 @@ function Get-CitrixDataset {
     # src/40-ODataClient.ps1).
     Reset-ODataFetchWarnings
 
-    $preflight = Invoke-AuditPreflight -AuthContext $AuthContext -Config $Config
+    $preflight = Invoke-ReportPreflight -AuthContext $AuthContext -Config $Config
 
-    Write-AuditLog -Level Info -Message 'Fetching sessions...'
+    Write-ReportLog -Level Info -Message 'Fetching sessions...'
     $sessions = @(Get-CitrixSessionRecords -AuthContext $AuthContext -Config $Config `
         -ProgressAction $ProgressAction -CancellationCheck $CancellationCheck)
-    Write-AuditLog -Level Success -Message "Fetched $($sessions.Count) session record(s)."
+    Write-ReportLog -Level Success -Message "Fetched $($sessions.Count) session record(s)."
 
-    Write-AuditLog -Level Info -Message 'Fetching users, machines and delivery groups...'
+    Write-ReportLog -Level Info -Message 'Fetching users, machines and delivery groups...'
     $users = @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity 'Users' `
         -Fields @('Id','UserName','FullName','Upn','Sid','Domain') -ProgressAction $ProgressAction)
+    # ControllerDnsName is not used by any breakdown; it is here because the
+    # machine records are the only place the Monitor API reveals which
+    # controllers the site has, which is what lets two exports be recognized
+    # as the same site later. See Get-CitrixSiteIdentity (55-SiteIdentity.ps1).
     $machines = @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity 'Machines' `
-        -Fields @('Id','Name','DesktopGroupId','CatalogId') -ProgressAction $ProgressAction)
+        -Fields @('Id','Name','DesktopGroupId','CatalogId','ControllerDnsName') -ProgressAction $ProgressAction)
     $groups = @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity 'DesktopGroups' `
         -Fields @('Id','Name','SessionSupport','DeliveryType') -ProgressAction $ProgressAction)
     $catalogs = @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity 'Catalogs' `
@@ -1659,7 +2258,7 @@ function Get-CitrixDataset {
 
     $connections = @()
     if ($Config.IncludeClientDevices) {
-        Write-AuditLog -Level Info -Message 'Fetching connections for the client device breakdown...'
+        Write-ReportLog -Level Info -Message 'Fetching connections for the client device breakdown...'
         # EstablishmentDate, not StartDate: the Connection entity does not
         # carry the Session entity's date fields. See Get-CitrixWindowedRecords
         # for what happens if this site does not know that field.
@@ -1672,7 +2271,7 @@ function Get-CitrixDataset {
 
     $appInstances = @(); $applications = @()
     if ($Config.IncludeApplications) {
-        Write-AuditLog -Level Info -Message 'Fetching application instances for the application breakdown...'
+        Write-ReportLog -Level Info -Message 'Fetching application instances for the application breakdown...'
         # No date fields: nothing in this project reads them (only SessionKey and
         # ApplicationId are ever consumed), and Get-CitrixLookupRecords is a raw
         # pass-through that never applies ConvertTo-UtcDateTime, unlike Sessions -
@@ -1695,6 +2294,19 @@ function Get-CitrixDataset {
             -Fields @('Id','Name','PublishedName') -ProgressAction $ProgressAction)
     }
 
+    # Gathered after the lookups because it reads the machine, catalog and
+    # delivery group records rather than re-fetching them. Never allowed to
+    # fail a run: identity is what makes several reports combinable, not what
+    # makes one report correct.
+    Write-ReportLog -Level Info -Message 'Identifying the site...'
+    $siteIdentity = New-EmptySiteIdentity -Label $Config.EnvironmentLabel
+    try {
+        $siteIdentity = Get-CitrixSiteIdentity -AuthContext $AuthContext -Config $Config `
+            -Machines $machines -Catalogs $catalogs -DesktopGroups $groups
+    } catch {
+        Write-ReportLog -Level Warn -Message "The site could not be identified: $($_.Exception.Message). The report is unaffected, but it will not carry the details used to recognize this site alongside others."
+    }
+
     [pscustomobject]@{
         Sessions             = $sessions
         Users                = $users
@@ -1705,9 +2317,10 @@ function Get-CitrixDataset {
         ApplicationInstances = $appInstances
         Applications         = $applications
         Preflight            = $preflight
+        SiteIdentity         = $siteIdentity
         # Fetches that came back knowingly incomplete or unbounded. Carried on
         # the dataset so the REPORT can say so next to the affected figures,
-        # rather than the customer having to read audit.log to discover that a
+        # rather than the customer having to read usage-report.log to discover that a
         # device count is an arbitrary subset.
         FetchWarnings        = @(Get-ODataFetchWarnings)
         IsDemo               = $false
@@ -1735,7 +2348,7 @@ function New-DemoDataset {
 
     $rand = [System.Random]::new($Seed)
 
-    $groupNames = @('Finance Desktops','Engineering Desktops','Call Centre Apps','Executive Desktops','Contractor Apps')
+    $groupNames = @('Finance Desktops','Engineering Desktops','Call Center Apps','Executive Desktops','Contractor Apps')
     $groups = @(); $catalogs = @(); $machines = @()
 
     for ($g = 0; $g -lt $groupNames.Count; $g++) {
@@ -1748,9 +2361,14 @@ function New-DemoDataset {
         $catalogs += [pscustomobject]@{ Id = "cat-$g"; Name = "$($groupNames[$g]) Catalog" }
         $machineCount = 4 + $rand.Next(0, 8)
         for ($m = 0; $m -lt $machineCount; $m++) {
+            # Spread across two synthetic controllers so the demo exercises the
+            # multi-controller discovery path rather than the single-controller
+            # special case. The live shape must be matched field for field --
+            # see the note on the demo/live parity the test suite pins.
             $machines += [pscustomobject]@{
                 Id = "mc-$g-$m"; Name = "VDA-$g-$([string]::Format('{0:D2}', $m))"
                 DesktopGroupId = $gid; CatalogId = "cat-$g"
+                ControllerDnsName = "ddc-demo-0$(($m % 2) + 1).demo.local"
             }
         }
     }
@@ -1916,7 +2534,7 @@ function New-DemoDataset {
         # Synthetic data is never fetched, so it is never truncated.
         FetchWarnings        = @()
         IsDemo               = $true
-        # Mirrors the live Invoke-AuditPreflight shape field for field,
+        # Mirrors the live Invoke-ReportPreflight shape field for field,
         # including HistoryStartUtc and RetentionBasis, so the analysis stage
         # exercises exactly the same code path on demo data as on live data.
         Preflight            = [pscustomobject]@{
@@ -1929,10 +2547,825 @@ function New-DemoDataset {
             TruncatedWindows      = @()
             CheckedAtUtc          = $Config.RunStartUtc
         }
+
+        # Populated rather than empty so the demo report actually renders the
+        # site identity section. A demo whose sections are blank teaches a
+        # customer that those sections are always blank.
+        SiteIdentity         = [pscustomobject]@{
+            QueriedController    = 'ddc-demo-01.demo.local'
+            EnvironmentLabel     = $Config.EnvironmentLabel
+            CustomerId           = $null
+            IsCloud              = $false
+            ControllerFqdns      = @('ddc-demo-01.demo.local', 'ddc-demo-02.demo.local')
+            Agents               = @(
+                [pscustomobject]@{
+                    Fqdn = 'DDC-DEMO-01.DEMO.LOCAL'
+                    ComponentId = '00000000-0000-4000-8000-00000000d3m0'
+                    Version = '7.45.100.0'
+                    ComponentStatus = 'Active'
+                }
+            )
+            ProductVersion       = '7.45.100.0'
+            ResourceLocationId   = $null
+            ResourceLocationName = $null
+            Zones                = @(
+                [pscustomobject]@{ Uid = '00000000-0000-4000-8000-00000000z0n1'; Name = 'Primary' }
+            )
+            DeliveryGroupIds     = @($groups | ForEach-Object { $_.Id } | Sort-Object -Unique)
+            CatalogIds           = @($catalogs | ForEach-Object { $_.Id } | Sort-Object -Unique)
+            ClockSkewSeconds     = 0
+            BrokerSite           = $null
+            Notes                = @('Synthetic data; no site was contacted.')
+        }
     }
 }
 
 # endregion 50-DataModel.ps1
+
+# ----------------------------------------------------------------------------
+# region 55-SiteIdentity.ps1
+# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Site identity
+#
+# A report on its own says what was measured but not much about where it came
+# from beyond the hostname somebody typed into a dialog. That is enough while a
+# report is read alone, and not enough the moment several are read together:
+# two exports have to be recognizable as the same site or as different sites
+# before their user counts can safely be combined.
+#
+# Everything gathered here comes from the Monitor OData API, so it costs no
+# extra dependency and no extra permission.
+#
+# The site's license server is deliberately NOT here. The Monitor OData schema
+# does not expose license information at all -- not on any version, not under
+# any entity -- and a field that silently reports nothing would be worse than
+# an absent one. Get-CitrixBrokerSiteDetail covers that separately, optionally,
+# and through a different mechanism.
+# ---------------------------------------------------------------------------
+
+function ConvertTo-ClockSkewSeconds {
+    <#
+    .SYNOPSIS
+        Turns a server Date header and our own request window into a skew.
+    .DESCRIPTION
+        Split out from the request that obtains the header because this is the
+        part with any reasoning in it, and reasoning is worth testing directly
+        rather than through a mocked web call.
+
+        Our own reference point is the MIDPOINT of the request window. The
+        header is stamped somewhere between sending the request and seeing the
+        response, and we cannot know where, so the midpoint is the estimate
+        with the smallest worst-case error -- bounded by half the round trip
+        in either direction.
+
+        Returns $null for a missing or unparseable header. That is deliberately
+        distinct from returning zero: zero asserts the clocks agree, $null says
+        the question could not be answered, and a report should be able to tell
+        a reader which of those happened.
+    .OUTPUTS
+        A [double] of seconds -- positive when the site is ahead of this
+        machine -- or $null.
+    #>
+    [CmdletBinding()]
+    param(
+        $DateHeader,
+        [Parameter(Mandatory)][DateTime] $RequestSentUtc,
+        [Parameter(Mandatory)][DateTime] $ResponseSeenUtc
+    )
+
+    # Windows PowerShell hands back either a bare string or a single-element
+    # array depending on the response; both shapes arrive here and neither is
+    # worth distinguishing any further up.
+    if ($DateHeader -is [array]) {
+        $DateHeader = @($DateHeader | Where-Object { $_ } | Select-Object -First 1)[0]
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$DateHeader)) { return $null }
+
+    try {
+        $serverUtc = ([DateTimeOffset]::Parse(
+            [string]$DateHeader, [System.Globalization.CultureInfo]::InvariantCulture)).UtcDateTime
+    } catch {
+        return $null
+    }
+
+    $ourUtc = $RequestSentUtc.AddTicks([long]((($ResponseSeenUtc - $RequestSentUtc).Ticks) / 2))
+    return [math]::Round(($serverUtc - $ourUtc).TotalSeconds, 1)
+}
+
+function Get-CitrixSiteClockSkew {
+    <#
+    .SYNOPSIS
+        Measures the difference between this machine's clock and the site's.
+    .DESCRIPTION
+        Concurrency is a time-domain measurement. When two sites are combined
+        into one concurrency figure their event streams have to lie on a shared
+        timeline, and they only do so if both controllers agree about what time
+        it is. A site running ten minutes fast shifts its entire stream, which
+        can invent an overlap that never happened or erase one that did.
+
+        The measurement is the HTTP Date header, which every compliant server
+        sends, compared against the midpoint of our own request window. The
+        midpoint rather than either end because the header is stamped somewhere
+        inside that window and we cannot know where.
+
+        Date carries one-second resolution and the round trip adds noise of its
+        own, so anything under a couple of seconds is indistinguishable from
+        zero. This returns the raw number and leaves that judgment to the
+        caller, which is where the context about what matters lives.
+
+        Returns $null when the server sends no usable Date header. That is not
+        a failure -- it means this particular check could not be made, and the
+        report says so rather than reporting a skew of zero it did not measure.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $AuthContext
+    )
+
+    try {
+        $extra = Get-AuthRequestParameters -AuthContext $AuthContext
+        $url = (($AuthContext.ODataBase).TrimEnd('/')) + '/Users?$top=1'
+
+        $before = [DateTime]::UtcNow
+        $response = Invoke-WebRequest -Uri $url -Method Get `
+            -Headers $AuthContext.GetHeaders() -UseBasicParsing `
+            -TimeoutSec 60 -ErrorAction Stop @extra
+        $after = [DateTime]::UtcNow
+
+        return ConvertTo-ClockSkewSeconds -DateHeader $response.Headers['Date'] `
+            -RequestSentUtc $before -ResponseSeenUtc $after
+    } catch {
+        # A site that will not answer this probe still produces a perfectly
+        # good report; only the merge-time skew note is lost.
+        Write-ReportLog -Level Debug -Message "Could not measure clock skew: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-CitrixSiteIdentity {
+    <#
+    .SYNOPSIS
+        Collects everything available that identifies WHICH site produced this data.
+    .DESCRIPTION
+        Every lookup below degrades on its own. A site that does not know one
+        of these fields still produces all the others, with a note naming what
+        could not be determined, because a partial identity is worth a great
+        deal more than a failed run.
+    .OUTPUTS
+        One object. Callers do not need to wrap it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $AuthContext,
+        [Parameter(Mandatory)][pscustomobject] $Config,
+        $Machines,
+        $Catalogs,
+        $DesktopGroups
+    )
+
+    $notes = New-Object System.Collections.Generic.List[string]
+
+    # -- The controllers this site actually has -------------------------------
+    # Machine.ControllerDnsName names the controller each machine is registered
+    # against, so the machine records between them reveal every controller in
+    # the site rather than only the one that was typed in. On a site with more
+    # than one controller that is the difference between knowing a site was
+    # measured and knowing which site was measured.
+    #
+    # On Citrix Cloud this field holds something different, and calling it a
+    # Delivery Controller there would be wrong. Observed against a live cloud
+    # tenant: the values are Cloud Connector identifiers ("054049594d31") and
+    # Citrix's own control-plane hosts ("cp105391-19-1.prodcp12.local"), none
+    # of which the customer runs or would recognise as a controller. The
+    # values are still worth keeping -- they identify the registration hosts
+    # -- but the report has to name them for what they are, so IsCloud travels
+    # with them.
+    $controllers = @(
+        @($Machines) |
+            ForEach-Object { $_.ControllerDnsName } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { $_.Trim().ToLowerInvariant() } |
+            Sort-Object -Unique
+    )
+    if ($controllers.Count -eq 0) {
+        $notes.Add('No registration host names could be read from the machine records, so the hosts this site''s machines are registered against are not known.')
+    }
+
+    # -- The monitoring agent registration ------------------------------------
+    # The DirectorAgent entity -- named for Citrix Director, which consumes the
+    # same Monitor Service data this script does; the entity describes the
+    # monitoring agent itself, not a Director installation.
+    #
+    # Carries a stable component identifier and the product version. Verified
+    # against a live Citrix Cloud tenant to return NO rows there, so on the
+    # cloud path this is expected to be empty rather than exceptional. Fetched inside its own try/catch
+    # because it is the least universal of these entities and must never be
+    # able to fail a run.
+    $agents = @()
+    try {
+        $agents = @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity 'DirectorAgent' `
+            -Fields @('Id', 'ComponentId', 'Fqdn', 'Version', 'ComponentStatus', 'ResourceLocationId', 'ResourceLocationName'))
+    } catch {
+        $notes.Add('This site returned no monitoring agent registration, so its component identifier and product version are unknown. Citrix Cloud sites do not expose this.')
+    }
+
+    $productVersion = $null
+    $resourceLocationId = $null
+    $resourceLocationName = $null
+
+    if ($agents.Count -gt 0) {
+        $versions = @($agents | ForEach-Object { $_.Version } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+        if ($versions.Count -gt 0) { $productVersion = $versions -join ', ' }
+
+        # The all-zero GUID is how an on-premises site reports "no resource
+        # location". That is a real answer rather than a missing one, so it is
+        # filtered out here instead of being surfaced as though it identified
+        # something.
+        $locationIds = @($agents | ForEach-Object { $_.ResourceLocationId } |
+            Where-Object { $_ -and $_ -ne '00000000-0000-0000-0000-000000000000' } | Sort-Object -Unique)
+        if ($locationIds.Count -gt 0) { $resourceLocationId = $locationIds -join ', ' }
+
+        $locationNames = @($agents | ForEach-Object { $_.ResourceLocationName } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+        if ($locationNames.Count -gt 0) { $resourceLocationName = $locationNames -join ', ' }
+    }
+
+    # -- Zones ----------------------------------------------------------------
+    # Requested separately rather than folded into the main Catalogs fetch: if
+    # a site does not know ZoneUid the server rejects the entire select list,
+    # and that must cost the zone names only, never the catalog names the rest
+    # of the report depends on.
+    #
+    # An empty zone list means one of two different things, and a reader of
+    # the exported identity block cannot tell them apart from the emptiness
+    # alone: the fetch failed, or the fetch worked and the site simply does
+    # not populate the field. Observed live: a single-zone site returns the
+    # ZoneUid column as null on every catalog. Both cases get their own note
+    # so the block explains itself without anyone knowing this rule.
+    $zones = @()
+    $zonesFetched = $false
+    try {
+        $zoned = @(Get-CitrixLookupRecords -AuthContext $AuthContext -Entity 'Catalogs' `
+            -Fields @('Id', 'ZoneUid', 'ZoneName'))
+        $zonesFetched = $true
+        $zones = @(
+            $zoned | Where-Object { $_.ZoneUid } |
+                Group-Object -Property ZoneUid |
+                ForEach-Object {
+                    $names = @($_.Group | ForEach-Object { $_.ZoneName } | Where-Object { $_ })
+                    [pscustomobject]@{
+                        Uid  = $_.Name
+                        Name = if ($names.Count -gt 0) { $names[0] } else { $null }
+                    }
+                } | Sort-Object -Property Uid
+        )
+    } catch {
+        $notes.Add('This site rejected the request for zone information, so its zones are unknown.')
+    }
+    if ($zonesFetched -and $zones.Count -eq 0) {
+        $notes.Add('This site answered the request for zone information but left it empty, so no zones are recorded against its catalogs.')
+    }
+
+    # -- Identifiers used to recognize a repeated site when merging -----------
+    # Delivery group and catalog identifiers are GUIDs minted by the site
+    # itself, so two exports that share any of them came from the same site.
+    # That is a far more reliable duplicate signal than a hostname, which can
+    # legitimately differ between two runs against one site.
+    $groupIds = @(@($DesktopGroups) | ForEach-Object { $_.Id } | Where-Object { $_ } | Sort-Object -Unique)
+    $catalogIds = @(@($Catalogs) | ForEach-Object { $_.Id } | Where-Object { $_ } | Sort-Object -Unique)
+
+    $skew = Get-CitrixSiteClockSkew -AuthContext $AuthContext
+
+    [pscustomobject]@{
+        QueriedController    = $Config.DeliveryController
+        EnvironmentLabel     = $Config.EnvironmentLabel
+        # The tenant this came from. On Citrix Cloud this is the single most
+        # identifying thing available and the only one checkable against
+        # records held outside the customer's own environment -- without it a
+        # cloud report does not say WHICH tenant produced it. It is an
+        # identifier, not a credential: it travels in the request URL and is
+        # not secret. $null on-premises, where the controller name serves the
+        # same purpose.
+        CustomerId           = $Config.CustomerId
+        IsCloud              = [bool] $Config.IsCloud
+        ControllerFqdns      = $controllers
+        Agents               = @($agents | ForEach-Object {
+                [pscustomobject]@{
+                    Fqdn            = $_.Fqdn
+                    ComponentId     = $_.ComponentId
+                    Version         = $_.Version
+                    ComponentStatus = $_.ComponentStatus
+                }
+            })
+        ProductVersion       = $productVersion
+        ResourceLocationId   = $resourceLocationId
+        ResourceLocationName = $resourceLocationName
+        Zones                = $zones
+        DeliveryGroupIds     = $groupIds
+        CatalogIds           = $catalogIds
+        ClockSkewSeconds     = $skew
+        BrokerSite           = $null
+        Notes                = @($notes)
+    }
+}
+
+function New-EmptySiteIdentity {
+    <#
+    .SYNOPSIS
+        The identity block for data that did not come from a live site.
+    .DESCRIPTION
+        Demo runs still carry an identity block so that the demo dataset has
+        exactly the same shape as a live one. The test suite pins that parity
+        deliberately: a field that exists only on the live path is a field
+        nothing exercises until a customer runs it.
+    #>
+    [CmdletBinding()]
+    param(
+        [string] $Label = 'Demo data'
+    )
+
+    [pscustomobject]@{
+        QueriedController    = $Label
+        EnvironmentLabel     = $Label
+        CustomerId           = $null
+        IsCloud              = $false
+        ControllerFqdns      = @()
+        Agents               = @()
+        ProductVersion       = $null
+        ResourceLocationId   = $null
+        ResourceLocationName = $null
+        Zones                = @()
+        DeliveryGroupIds     = @()
+        CatalogIds           = @()
+        ClockSkewSeconds     = $null
+        BrokerSite           = $null
+        Notes                = @('Synthetic data; no site was contacted.')
+    }
+}
+
+# endregion 55-SiteIdentity.ps1
+
+# ----------------------------------------------------------------------------
+# region 57-Identity.ps1
+# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Cross-site user identity
+#
+# Every decision in this file is a measurement, recorded in
+# docs/REFERENCE.md section 5. In summary, taken from two live sites:
+#
+#   Users.Id           site-local row number. Both sites number from 1, and
+#                      in both, Id=1 is ANONYMOUS LOGON while Id=2 is a
+#                      different person. Never leaves its site.
+#   Sid                100% populated in both sites and unique within each.
+#                      The cross-site key.
+#   Upn                absent on a quarter of cloud users, and FOUR UPNs each
+#                      mapped to two different SIDs inside one site. Usable
+#                      only as an opt-in bridge, and only where unambiguous.
+#   Domain\UserName    collided eight times inside one site, because NetBIOS
+#                      names are not globally unique. Not offered at all.
+# ---------------------------------------------------------------------------
+
+# Only these two prefixes identify a principal issued by a Windows security
+# authority. Everything else in the S-1-5 space is machine-independent:
+# S-1-5-7 (ANONYMOUS LOGON) is byte-identical on every Windows system on
+# earth, so a key built from it would merge every site's anonymous activity
+# into one fictional person who appears to use all of them. An allow-list
+# rather than a deny-list, because the set of well-known SIDs is long and
+# grows.
+#
+# "Windows security authority" rather than "Active Directory domain", which is
+# what an earlier version of this comment said. A live Citrix Cloud Government
+# site contained an account whose Domain field held a machine name
+# (JD-NDJ-W11-VD01) -- a LOCAL account on a VDA, whose SID is
+# S-1-5-21-<machine>-<RID> and therefore structurally identical to a domain
+# SID. Accepting it is correct: a machine's authority SID is as globally
+# unique as a domain's, so the same local account seen from two sites still
+# resolves to one key and two different machines never collide. Only the
+# description was wrong.
+$script:DomainSidPrefixes = @('S-1-5-21-', 'S-1-12-1-')
+
+# Domain separation for the two derived key spaces. A bridge key and a user
+# key derived from the same salt must never collide, or a UPN match could be
+# mistaken for a SID match.
+$script:UserKeyLabel = 'citrix-usage-report/user/v1'
+$script:BridgeKeyLabel = 'citrix-usage-report/bridge-upn/v1'
+$script:ForestKeyLabel = 'citrix-usage-report/forest/v1'
+
+function Test-DomainSid {
+    <#
+    .SYNOPSIS
+        Whether a SID identifies a directory principal and may be a merge key.
+    .OUTPUTS
+        [bool]. Never throws; malformed input is simply not a domain SID.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([AllowNull()][string] $Sid)
+
+    if ([string]::IsNullOrWhiteSpace($Sid)) { return $false }
+    $s = $Sid.Trim().ToUpperInvariant()
+
+    foreach ($prefix in $script:DomainSidPrefixes) {
+        if ($s.StartsWith($prefix)) {
+            # A prefix alone is not enough: "S-1-5-21-" with nothing after it
+            # is not a principal. Require at least one more numeric component.
+            $tail = $s.Substring($prefix.Length)
+            if ($tail -match '^\d+(-\d+)*$') { return $true }
+        }
+    }
+    return $false
+}
+
+function Get-CanonicalSid {
+    <#
+    .SYNOPSIS
+        A SID normalized for use as a key, or $null if it cannot be one.
+    .DESCRIPTION
+        Upper-cased because SID text is case-insensitive: letting case through
+        would split one person into two keys, which is the same class of
+        defect as the case folding already applied to usernames in
+        Get-WindowUserTotals.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][string] $Sid)
+
+    if (-not (Test-DomainSid -Sid $Sid)) { return $null }
+    return $Sid.Trim().ToUpperInvariant()
+}
+
+function Get-DerivedKey {
+    <#
+    .SYNOPSIS
+        HMAC-SHA256 of a label and a value under a salt, truncated to 128 bits.
+    .DESCRIPTION
+        Internal. The label separates key spaces so that two different kinds
+        of identifier derived from one salt cannot collide.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string] $Label,
+        [Parameter(Mandatory)][string] $Value,
+        [Parameter(Mandatory)][byte[]] $Salt
+    )
+
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256 (, $Salt)
+    try {
+        $bytes = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes("$Label`n$Value"))
+    } finally {
+        $hmac.Dispose()
+    }
+    # 128 bits. The population is thousands of users, not billions, so
+    # collision probability here is negligible and the key stays readable.
+    return (-join ($bytes[0..15] | ForEach-Object { $_.ToString('x2') }))
+}
+
+function Get-UserIdentityKey {
+    <#
+    .SYNOPSIS
+        The key that identifies one person across sites and across exports.
+    .DESCRIPTION
+        Without a salt this is the canonical SID: already stable across sites,
+        and a non-anonymized export is entitled to carry it.
+
+        With a salt it is an HMAC of that SID. Not a plain hash -- a domain SID
+        prefix is not secret and RIDs allocate from a small dense range, so
+        SHA256(sid) would let anyone holding an anonymized export enumerate the
+        whole population in seconds. See src/58-Salt.ps1.
+    .OUTPUTS
+        [string], or $null when the SID may not be a key at all.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()][string] $Sid,
+        [AllowNull()][byte[]] $Salt
+    )
+
+    $canonical = Get-CanonicalSid -Sid $Sid
+    if (-not $canonical) { return $null }
+    if (-not $Salt -or $Salt.Length -eq 0) { return $canonical }
+
+    return Get-DerivedKey -Label $script:UserKeyLabel -Value $canonical -Salt $Salt
+}
+
+function Get-UpnBridgeKey {
+    <#
+    .SYNOPSIS
+        The opt-in key for joining one person's accounts across two forests.
+    .DESCRIPTION
+        Lower-cased, because UPN case is not meaningful and letting it through
+        would split one person in two.
+
+        Deriving a key says nothing about whether it is SAFE to bridge on:
+        four UPNs in the sampled tenant each mapped to two different SIDs.
+        Get-AmbiguousUpn is what decides that, per export.
+    .OUTPUTS
+        [string], or $null when there is no usable UPN.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()][string] $Upn,
+        [AllowNull()][byte[]] $Salt
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Upn)) { return $null }
+    $normalized = $Upn.Trim().ToLowerInvariant()
+    # A UPN without an @ is not a UPN; some sites put a bare sAMAccountName
+    # in the field, which must not be bridged on as though it were one.
+    if ($normalized -notmatch '^[^@\s]+@[^@\s]+$') { return $null }
+
+    if (-not $Salt -or $Salt.Length -eq 0) { return $normalized }
+    return Get-DerivedKey -Label $script:BridgeKeyLabel -Value $normalized -Salt $Salt
+}
+
+function Get-ForestKey {
+    <#
+    .SYNOPSIS
+        A stable key for the directory a principal belongs to.
+    .DESCRIPTION
+        Exists so that "this bridge joins accounts from three forests" is
+        computable from an anonymized export, where the user key is opaque by
+        design. A live three-site run showed that a bridge widening across
+        forests is exactly what a UPN collision looks like, so the count has
+        to be available to the report.
+
+        An AD SID is S-1-5-21-<domain>-<RID>, so dropping the last component
+        gives the domain. Two accounts in one forest therefore share a key.
+
+        Entra SIDs return $null. S-1-12-1-w-x-y-z encodes the object GUID
+        itself and has no domain component; dropping the last chunk would give
+        every user a different "forest" and inflate the count into nonsense.
+        None of the four tenants sampled during research contained one, so
+        this is handled conservatively rather than guessed at.
+    .OUTPUTS
+        [string], or $null when there is no forest to name.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()][string] $Sid,
+        [AllowNull()][byte[]] $Salt
+    )
+
+    $canonical = Get-CanonicalSid -Sid $Sid
+    if (-not $canonical) { return $null }
+    if ($canonical.StartsWith('S-1-12-1-')) { return $null }
+
+    $lastDash = $canonical.LastIndexOf('-')
+    if ($lastDash -le 0) { return $null }
+    $prefix = $canonical.Substring(0, $lastDash)
+
+    if (-not $Salt -or $Salt.Length -eq 0) { return $prefix }
+    return Get-DerivedKey -Label $script:ForestKeyLabel -Value $prefix -Salt $Salt
+}
+
+function Get-AmbiguousUpn {
+    <#
+    .SYNOPSIS
+        UPNs that map to more than one directory principal in this site.
+    .DESCRIPTION
+        A UPN may bridge two identities across forests only where it
+        unambiguously means one person. Measured in a live cloud tenant: four
+        UPNs each mapped to two different SIDs, because two separate forests
+        shared a UPN suffix -- user1@nht39.sp existed in both, as two different
+        people. Bridging on it would merge them.
+
+        The ambiguity is a property of the data, so it is computed rather than
+        assumed. A UPN listed here is excluded from bridging and reported.
+    .OUTPUTS
+        A plain array of lowercase UPN strings, sorted. Callers wrap in @().
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([AllowNull()][AllowEmptyCollection()] $Users)
+
+    $sidsByUpn = @{}
+
+    foreach ($u in @($Users)) {
+        if (-not $u) { continue }
+
+        # A row whose SID could never be a key must not be able to make a real
+        # UPN look ambiguous.
+        $sid = Get-CanonicalSid -Sid ([string]$u.Sid)
+        if (-not $sid) { continue }
+
+        $upn = [string]$u.Upn
+        if ([string]::IsNullOrWhiteSpace($upn)) { continue }
+        $upn = $upn.Trim().ToLowerInvariant()
+
+        if (-not $sidsByUpn.ContainsKey($upn)) {
+            $sidsByUpn[$upn] = New-Object 'System.Collections.Generic.HashSet[string]'
+        }
+        [void] $sidsByUpn[$upn].Add($sid)
+    }
+
+    $ambiguous = New-Object System.Collections.Generic.List[string]
+    foreach ($upn in $sidsByUpn.Keys) {
+        if ($sidsByUpn[$upn].Count -gt 1) { $ambiguous.Add($upn) }
+    }
+
+    return ($ambiguous | Sort-Object)
+}
+
+# endregion 57-Identity.ps1
+
+# ----------------------------------------------------------------------------
+# region 58-Salt.ps1
+# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# The anonymization salt
+#
+# Consolidating several exports requires that the same person resolve to the
+# same key in all of them, which means the key cannot be a per-run pseudonym.
+# It is an HMAC of the user's SID, and this file owns the secret that HMAC is
+# keyed with.
+#
+# Why a keyed HMAC and not a hash: a plain SHA256 of a SID is reversible in
+# practice. A domain SID prefix is not secret, and RIDs are allocated from a
+# small dense range starting at 1000, so anyone holding an anonymized export
+# could hash every candidate RID under the known prefix and recover the entire
+# population in seconds. A secret salt removes the attacker's ability to
+# compute candidate digests at all.
+#
+# That makes the salt operationally load-bearing. It is written to a file the
+# customer keeps, alongside identity-map.csv, and the same file must be used
+# for every export intended for one consolidated report. Losing it does not
+# damage existing exports; it permanently ends the ability to join new ones to
+# them.
+# ---------------------------------------------------------------------------
+
+# Fixed, public, and deliberately not a secret. It only has to differ from any
+# other use of the same salt so that a fingerprint cannot be replayed as a
+# user key or vice versa.
+$script:SaltFingerprintLabel = 'citrix-usage-report/salt-check'
+
+function New-ReportSalt {
+    <#
+    .SYNOPSIS
+        Generates a new 256-bit anonymization salt.
+    .OUTPUTS
+        A [byte[]] of 32 cryptographically random bytes.
+    #>
+    [CmdletBinding()]
+    [OutputType([byte[]])]
+    param()
+
+    # RNGCryptoServiceProvider rather than Get-Random: Get-Random is seeded
+    # from the clock and is not suitable for anything a secret depends on.
+    $bytes = New-Object byte[] 32
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    try {
+        $rng.GetBytes($bytes)
+    } finally {
+        $rng.Dispose()
+    }
+    return $bytes
+}
+
+function Get-SaltFingerprint {
+    <#
+    .SYNOPSIS
+        A non-reversible identifier for a salt, safe to put in an export.
+    .DESCRIPTION
+        Two exports made under different salts would show every person twice
+        and inflate the consolidated count, silently. The fingerprint lets a
+        merge refuse mismatched inputs instead of producing a wrong number.
+
+        It is an HMAC over a fixed public label rather than over nothing, so
+        that a fingerprint can never coincide with a user key derived from the
+        same salt.
+    .OUTPUTS
+        A [string] of 32 lowercase hex characters.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][byte[]] $Salt)
+
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256 (, $Salt)
+    try {
+        $bytes = $hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($script:SaltFingerprintLabel))
+    } finally {
+        $hmac.Dispose()
+    }
+    # Truncated to 128 bits: this is an equality check, not a signature.
+    return (-join ($bytes[0..15] | ForEach-Object { $_.ToString('x2') }))
+}
+
+function Get-SaltFileInfo {
+    <#
+    .SYNOPSIS
+        Describes a salt file without creating or changing one.
+    .DESCRIPTION
+        Get-ReportSalt creates the file when it is missing, which is right for
+        a run and wrong for a dialog that is only asking "is this the file you
+        meant?". The operator needs that answer BEFORE committing to a run:
+        pointing at the wrong key, or accidentally minting a second one,
+        produces exports that look perfectly normal and can never be
+        consolidated with the ones already taken.
+
+        The fingerprint is the part that makes the answer checkable. It is
+        shown at every site, so an operator can compare the value in front of
+        them against the one the first site displayed and see that they match.
+    .OUTPUTS
+        One object with Path, Exists, Valid, Fingerprint and Error.
+    #>
+    [CmdletBinding()]
+    param([AllowEmptyString()][AllowNull()][string] $Path)
+
+    $info = [pscustomobject]@{
+        Path = $Path; Exists = $false; Valid = $false
+        Fingerprint = $null; Error = $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $info.Error = 'No path given.'
+        return $info
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $info }
+
+    $info.Exists = $true
+    try {
+        $encoded = (Get-Content -LiteralPath $Path -Raw).Trim()
+        $salt = [Convert]::FromBase64String($encoded)
+    } catch {
+        $info.Error = 'The file is not valid base64, so it is not a key file this tool wrote.'
+        return $info
+    }
+    if ($salt.Length -ne 32) {
+        $info.Error = "The file holds $($salt.Length) byte(s), not 32. It looks truncated or edited."
+        return $info
+    }
+
+    $info.Valid = $true
+    $info.Fingerprint = Get-SaltFingerprint -Salt $salt
+    return $info
+}
+
+function Get-ReportSalt {
+    <#
+    .SYNOPSIS
+        Loads the salt from a file, creating it on first use.
+    .DESCRIPTION
+        The file is the customer's to keep and to carry between sites. This
+        function never regenerates over an existing one: a second run that
+        silently minted a new salt would make every later export double-count
+        every person against the earlier ones, and nothing in the output would
+        look wrong.
+    .OUTPUTS
+        One object with Salt, Fingerprint, Path and Created. Callers do not
+        need to wrap it.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Path)
+
+    $created = $false
+
+    $existing = Get-SaltFileInfo -Path $Path
+    if ($existing.Exists) {
+        # The same checks the dialog shows, applied here as refusals. A
+        # weakened or unrelated salt still produces plausible-looking keys, so
+        # this must stop rather than proceed.
+        if (-not $existing.Valid) {
+            throw "The salt file at $Path cannot be used. $($existing.Error) Restore the original file; a different salt cannot be consolidated with exports already made under the old one."
+        }
+        $salt = [Convert]::FromBase64String((Get-Content -LiteralPath $Path -Raw).Trim())
+    } else {
+        $salt = New-ReportSalt
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+        }
+        Set-Content -LiteralPath $Path -Value ([Convert]::ToBase64String($salt)) `
+            -Encoding ascii -ErrorAction Stop
+        $created = $true
+    }
+
+    # Registered before anything can log, so the salt cannot reach a log line
+    # through an unexpected code path. The base64 form is the only one ever
+    # held as a string, so it is the form that needs masking.
+    Register-ReportSecret -Secret ([Convert]::ToBase64String($salt))
+
+    if ($created) {
+        Write-ReportLog -Level Warn -Message "A new anonymization salt was created at $Path. KEEP THIS FILE. Every export you intend to consolidate into one report must use the same salt, and losing it permanently ends the ability to join future exports to the ones you already have."
+    } else {
+        Write-ReportLog -Level Info -Message "Using the existing anonymization salt at $Path."
+    }
+
+    [pscustomobject]@{
+        Salt        = $salt
+        Fingerprint = Get-SaltFingerprint -Salt $salt
+        Path        = $Path
+        Created     = $created
+    }
+}
+
+# endregion 58-Salt.ps1
 
 # ----------------------------------------------------------------------------
 # region 60-Analytics.ps1
@@ -1940,7 +3373,7 @@ function New-DemoDataset {
 # ============================================================================
 #  Analytics
 #
-#  Pure functions over the normalised dataset. No network, no formatting, no
+#  Pure functions over the normalized dataset. No network, no formatting, no
 #  global state. Correctness matters more here than anywhere else in the
 #  script, because a wrong number in this file becomes a wrong usage figure
 #  in a customer's licensing conversation, and nothing downstream would
@@ -1985,7 +3418,7 @@ function Get-ClampedSessionInterval {
         or instantly-abandoned launch), and one that touches the window only
         at its very first or very last instant. The interval is half-open,
         [start, end), throughout this file, so a zero-length interval
-        genuinely contains no sampled instant and cannot occupy a licence for
+        genuinely contains no sampled instant and cannot occupy a license for
         any measurable time. The alternative -- counting it as one session --
         would inflate TotalSessions with launches that never ran.
     #>
@@ -1997,15 +3430,40 @@ function Get-ClampedSessionInterval {
         [Parameter(Mandatory)][datetime] $NowUtc
     )
 
+    # The window check stays HERE, on the public entry point, because two
+    # tests require this function to throw on a reversed window and the
+    # reason is recorded with them: a reversed window is an upstream bug, not
+    # a legitimate empty window, and must fail loudly rather than report a
+    # misleadingly clamped-to-nothing interval.
+    #
+    # The arithmetic lives in the Core function below so the per-session
+    # loops can skip this check, which they have already performed once for
+    # the whole loop. One source of truth, two entry points.
     Assert-ValidAnalyticsWindow -WindowStartUtc $WindowStartUtc -WindowEndUtc $WindowEndUtc
 
+    Get-ClampedSessionIntervalCore $Session $WindowStartUtc $WindowEndUtc $NowUtc
+}
+
+function Get-ClampedSessionIntervalCore($Session, $WindowStartUtc, $WindowEndUtc, $NowUtc) {
+    # Deliberately a PLAIN function: no [CmdletBinding()], no parameter
+    # attributes, no validation. It is called once per session from six
+    # places, so at 500,000 sessions across three windows it runs millions of
+    # times, and PowerShell's advanced-function parameter binder is the
+    # dominant cost in what was a 2 h 34 min analysis.
+    #
+    # Callers MUST have validated the window themselves. All six do, up
+    # front, before their loops -- which is also what makes the per-session
+    # check redundant rather than merely expensive.
+    #
+    # The rules encoded here are subtle and must stay in exactly one place:
+    # a null end means the session is still open; nothing counts past the
+    # moment the site was observed; the interval is clamped to the window;
+    # and a zero-or-negative interval is dropped, because [start, end) is
+    # half-open so it contains no sampled instant.
     $start = $Session.StartUtc
     if (-not $start) { return $null }
 
-    # No end date means the session is open right now.
     $end = if ($Session.EndUtc) { $Session.EndUtc } else { $NowUtc }
-
-    # A session cannot be counted past the moment we observed the site.
     if ($end -gt $NowUtc) { $end = $NowUtc }
 
     if ($start -lt $WindowStartUtc) { $start = $WindowStartUtc }
@@ -2039,27 +3497,70 @@ function Get-PeakConcurrency {
 
     Assert-ValidAnalyticsWindow -WindowStartUtc $WindowStartUtc -WindowEndUtc $WindowEndUtc
 
-    $events = New-Object System.Collections.Generic.List[object]
+    # Events are packed into a single long instead of an object per event:
+    #
+    #     key = ticks * 2 + order        order 0 = end, 1 = start
+    #
+    # Sorting the packed value sorts by instant and, within an instant, puts
+    # ends before starts -- the tie-break that stops a session ending exactly
+    # as another begins from being counted as concurrent. It is the same rule
+    # the object version expressed as a secondary sort key, not a new one.
+    #
+    # Why: this built two PSCustomObjects per session and ran Sort-Object
+    # over them -- a million objects per window at 500,000 sessions, sorted
+    # three times. [Array]::Sort over primitives does the same work without
+    # the allocation.
+    #
+    # ticks * 2 cannot overflow: DateTime.MaxValue is ~3.16e18 ticks and
+    # Int64.MaxValue is ~9.22e18.
+    $keys = New-Object 'System.Collections.Generic.List[long]'
 
+    # Cancellation is checked on a counter rather than every iteration: the
+    # counter increment and mask test below run every iteration regardless
+    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
+    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
+    # measured at 500k across the three default windows) -- and only the
+    # rare IsCancellationRequested read is gated by the interval.
+    #
+    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
+    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
+    # cost of the WORK between checkpoints. At the real work rate, 65,536
+    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
+    # sessions -- which leaves Cancel looking dead for half a minute against
+    # the "reacts within seconds" requirement this task exists for. 0x7FF
+    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
+    # exactly where it was.
+    $cancelTick = 0
     foreach ($s in $Sessions) {
-        $i = Get-ClampedSessionInterval -Session $s -WindowStartUtc $WindowStartUtc `
-            -WindowEndUtc $WindowEndUtc -NowUtc $NowUtc
+        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
+            $script:ReportCancellationSource.IsCancellationRequested) {
+            throw (New-Object System.OperationCanceledException 'The run was canceled.')
+        }
+        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
         if (-not $i) { continue }
-        # Order 0 = end, 1 = start, so ends are processed first on a tie.
-        [void] $events.Add([pscustomobject]@{ At = $i.EndUtc;   Delta = -1; Order = 0 })
-        [void] $events.Add([pscustomobject]@{ At = $i.StartUtc; Delta =  1; Order = 1 })
+        [void] $keys.Add(($i.EndUtc.Ticks   * 2))
+        [void] $keys.Add(($i.StartUtc.Ticks * 2) + 1)
     }
 
-    if ($events.Count -eq 0) {
+    if ($keys.Count -eq 0) {
         return [pscustomobject]@{ Peak = 0; PeakAtUtc = $null }
     }
 
-    $sorted = $events | Sort-Object -Property At, Order
+    $sorted = $keys.ToArray()
+    [Array]::Sort($sorted)
 
-    $current = 0; $peak = 0; $peakAt = $null
-    foreach ($e in $sorted) {
-        $current += $e.Delta
-        if ($current -gt $peak) { $peak = $current; $peakAt = $e.At }
+    $current = 0; $peak = 0; $peakTicks = [long] 0
+    foreach ($key in $sorted) {
+        # -band / -shr rather than % and /: PowerShell's division returns a
+        # double, which silently loses precision above 2^53 -- and a tick
+        # count is far above it.
+        if ($key -band 1) { $current++ } else { $current-- }
+        if ($current -gt $peak) { $peak = $current; $peakTicks = $key -shr 1 }
+    }
+
+    $peakAt = $null
+    if ($peak -gt 0) {
+        $peakAt = [datetime]::new($peakTicks, [System.DateTimeKind]::Utc)
     }
 
     [pscustomobject]@{ Peak = $peak; PeakAtUtc = $peakAt }
@@ -2100,16 +3601,35 @@ function Get-ConcurrencySeries {
     # remainder (e.g. a 65-minute window at 60-minute resolution must sample
     # both minute 0 and minute 60). Floor would drop that instant, and with
     # it any session open only during the remainder, understating the p95
-    # that a licence count gets sized against. When the window divides
-    # evenly, Ceiling and Floor agree, so no existing behaviour changes.
+    # that a license count gets sized against. When the window divides
+    # evenly, Ceiling and Floor agree, so no existing behavior changes.
     $bucketCount = [int][math]::Ceiling(($WindowEndUtc - $WindowStartUtc).TotalMinutes / $IntervalMinutes)
     if ($bucketCount -le 0) { return @() }
 
     $counts = New-Object 'int[]' $bucketCount
 
+    # Cancellation is checked on a counter rather than every iteration: the
+    # counter increment and mask test below run every iteration regardless
+    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
+    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
+    # measured at 500k across the three default windows) -- and only the
+    # rare IsCancellationRequested read is gated by the interval.
+    #
+    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
+    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
+    # cost of the WORK between checkpoints. At the real work rate, 65,536
+    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
+    # sessions -- which leaves Cancel looking dead for half a minute against
+    # the "reacts within seconds" requirement this task exists for. 0x7FF
+    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
+    # exactly where it was.
+    $cancelTick = 0
     foreach ($s in $Sessions) {
-        $i = Get-ClampedSessionInterval -Session $s -WindowStartUtc $WindowStartUtc `
-            -WindowEndUtc $WindowEndUtc -NowUtc $NowUtc
+        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
+            $script:ReportCancellationSource.IsCancellationRequested) {
+            throw (New-Object System.OperationCanceledException 'The run was canceled.')
+        }
+        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
         if (-not $i) { continue }
 
         # The first bucket whose start instant falls at or after the session
@@ -2140,7 +3660,7 @@ function Get-ConcurrencySeries {
     return $series.ToArray()
 }
 
-function Resolve-AuditTimeZone {
+function Resolve-ReportTimeZone {
     <#
     .SYNOPSIS
         Resolves a Windows time zone id, degrading to UTC rather than throwing.
@@ -2167,7 +3687,7 @@ function Resolve-AuditTimeZone {
     try {
         return [System.TimeZoneInfo]::FindSystemTimeZoneById($TimeZoneId)
     } catch {
-        Write-AuditLog -Level Warn -Message "Time zone '$TimeZoneId' is not known to this machine; business-hours figures are computed in UTC instead. Peak and percentile figures for all hours are unaffected."
+        Write-ReportLog -Level Warn -Message "Time zone '$TimeZoneId' is not known to this machine; business-hours figures are computed in UTC instead. Peak and percentile figures for all hours are unaffected."
         return [System.TimeZoneInfo]::Utc
     }
 }
@@ -2196,7 +3716,7 @@ function Test-InBusinessHours {
     )
 
     # ConvertTimeFromUtc throws on a DateTimeKind of Local, and treats
-    # Unspecified as UTC. Normalising here keeps a caller that built its
+    # Unspecified as UTC. Normalizing here keeps a caller that built its
     # series from an Unspecified-kind window from silently shifting.
     $u = if ($Utc.Kind -eq [System.DateTimeKind]::Local) {
         $Utc.ToUniversalTime()
@@ -2248,8 +3768,8 @@ function Get-UniqueUserStats {
         Distinct users with at least one session overlapping the window.
     .DESCRIPTION
         Anonymous sessions are counted separately and excluded from the user
-        total, because they do not consume a named user licence. Folding them
-        in would overstate the licence requirement.
+        total, because they do not consume a named user license. Folding them
+        in would overstate the license requirement.
     #>
     [CmdletBinding()]
     param(
@@ -2277,9 +3797,28 @@ function Get-UniqueUserStats {
     $unattributed = 0
     $total = 0
 
+    # Cancellation is checked on a counter rather than every iteration: the
+    # counter increment and mask test below run every iteration regardless
+    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
+    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
+    # measured at 500k across the three default windows) -- and only the
+    # rare IsCancellationRequested read is gated by the interval.
+    #
+    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
+    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
+    # cost of the WORK between checkpoints. At the real work rate, 65,536
+    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
+    # sessions -- which leaves Cancel looking dead for half a minute against
+    # the "reacts within seconds" requirement this task exists for. 0x7FF
+    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
+    # exactly where it was.
+    $cancelTick = 0
     foreach ($s in $Sessions) {
-        $i = Get-ClampedSessionInterval -Session $s -WindowStartUtc $WindowStartUtc `
-            -WindowEndUtc $WindowEndUtc -NowUtc $NowUtc
+        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
+            $script:ReportCancellationSource.IsCancellationRequested) {
+            throw (New-Object System.OperationCanceledException 'The run was canceled.')
+        }
+        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
         if (-not $i) { continue }
 
         $total++
@@ -2313,7 +3852,7 @@ function Get-DailyTrend {
         Unique users and peak concurrency for each day in the window.
     .DESCRIPTION
         A session spanning several days counts on every day it touches, since
-        it occupies a licence on each of them.
+        it occupies a license on each of them.
 
         Returns a plain array, per the codebase convention: callers wrap the
         call in @() to get a reliable Count for zero, one, or many days. See
@@ -2357,9 +3896,28 @@ function Get-DailyTrend {
     $byDay = @{}
     for ($d = 0; $d -lt $dayCount; $d++) { $byDay[$d] = New-Object System.Collections.Generic.List[object] }
 
+    # Cancellation is checked on a counter rather than every iteration: the
+    # counter increment and mask test below run every iteration regardless
+    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
+    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
+    # measured at 500k across the three default windows) -- and only the
+    # rare IsCancellationRequested read is gated by the interval.
+    #
+    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
+    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
+    # cost of the WORK between checkpoints. At the real work rate, 65,536
+    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
+    # sessions -- which leaves Cancel looking dead for half a minute against
+    # the "reacts within seconds" requirement this task exists for. 0x7FF
+    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
+    # exactly where it was.
+    $cancelTick = 0
     foreach ($s in $Sessions) {
-        $i = Get-ClampedSessionInterval -Session $s -WindowStartUtc $WindowStartUtc `
-            -WindowEndUtc $WindowEndUtc -NowUtc $NowUtc
+        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
+            $script:ReportCancellationSource.IsCancellationRequested) {
+            throw (New-Object System.OperationCanceledException 'The run was canceled.')
+        }
+        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
         if (-not $i) { continue }
 
         $from = [int][math]::Floor(($i.StartUtc.Date - $firstDay).TotalDays)
@@ -2425,6 +3983,24 @@ function Get-DeliveryGroupBreakdown {
     # attributed and filtered out downstream.
     Assert-ValidAnalyticsWindow -WindowStartUtc $WindowStartUtc -WindowEndUtc $WindowEndUtc
 
+    # No attribution basis at all means there is no breakdown to give, and
+    # saying so by omission is the only honest answer.
+    #
+    # Without this, every session falls to the "Unknown (machine no longer
+    # present)" bucket below and the report renders a chart and a table that
+    # look like a real per-group breakdown while asserting something false:
+    # that the machines were deleted. A consolidated report is exactly this
+    # case -- the merge export carries identity and time only, so Machines and
+    # DesktopGroups are empty by construction -- and a real three-site
+    # consolidation produced one row holding all 9 users and every session.
+    #
+    # Same guard, same reason, as Get-ApplicationBreakdown's below. The
+    # distinction it preserves: one missing machine among many IS a finding
+    # and still reports as Unknown; no machine data at all is not.
+    $haveMachines = @($Dataset.Machines).Count -gt 0
+    $haveGroups = @($Dataset.DesktopGroups).Count -gt 0
+    if (-not $haveMachines -and -not $haveGroups) { return @() }
+
     $machineToGroup = @{}
     foreach ($m in $Dataset.Machines) { $machineToGroup[[string]$m.Id] = [string]$m.DesktopGroupId }
 
@@ -2432,7 +4008,26 @@ function Get-DeliveryGroupBreakdown {
     foreach ($g in $Dataset.DesktopGroups) { $groupNames[[string]$g.Id] = [string]$g.Name }
 
     $byGroup = @{}
+
+    # Cancellation is checked on a counter rather than every iteration: the
+    # counter increment and mask test below run every iteration regardless
+    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
+    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
+    # measured at 500k across the three default windows) -- and only the
+    # rare IsCancellationRequested read is gated by the interval.
+    #
+    # This bucketing pass is otherwise invisible to Cancel: it runs before
+    # the per-group Get-UniqueUserStats / Get-PeakConcurrency calls below,
+    # each of which resets its OWN $cancelTick over just its group's slice --
+    # so unless a single delivery group holds more sessions than the check
+    # interval, none of those nested checks ever fire, and without this one
+    # a whole sweep of every session in the window has no checkpoint at all.
+    $cancelTick = 0
     foreach ($s in $Dataset.Sessions) {
+        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
+            $script:ReportCancellationSource.IsCancellationRequested) {
+            throw (New-Object System.OperationCanceledException 'The run was canceled.')
+        }
         $gid = $machineToGroup[[string]$s.MachineId]
         $name = if ($gid -and $groupNames.ContainsKey($gid)) { $groupNames[$gid] } else { 'Unknown (machine no longer present)' }
         if (-not $byGroup.ContainsKey($name)) {
@@ -2475,6 +4070,13 @@ function Get-SessionTypeBreakdown {
         [Parameter(Mandatory)][datetime] $WindowEndUtc,
         [Parameter(Mandatory)][datetime] $NowUtc
     )
+
+    # A single check here, not one instrumented inside either pipeline: two
+    # Where-Object passes over the same session set are cheap relative to the
+    # six Get-ClampedSessionIntervalCore loops, and splicing a counter check
+    # into a pipeline scriptblock (rather than a plain foreach body) is not
+    # the shape this codebase's cancellation checks use elsewhere.
+    Assert-NotCancelled
 
     $desktop = @($Sessions | Where-Object { $_.SessionType -eq 0 })
     $app     = @($Sessions | Where-Object { $_.SessionType -eq 1 })
@@ -2519,9 +4121,29 @@ function Get-ApplicationBreakdown {
     # the named-user tally even when IsAnonymous is (unusually) paired with a
     # non-blank UserId.
     $sessionInfo = @{}
+
+    # Cancellation is checked on a counter rather than every iteration: the
+    # counter increment and mask test below run every iteration regardless
+    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
+    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
+    # measured at 500k across the three default windows) -- and only the
+    # rare IsCancellationRequested read is gated by the interval.
+    #
+    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
+    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
+    # cost of the WORK between checkpoints. At the real work rate, 65,536
+    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
+    # sessions -- which leaves Cancel looking dead for half a minute against
+    # the "reacts within seconds" requirement this task exists for. 0x7FF
+    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
+    # exactly where it was.
+    $cancelTick = 0
     foreach ($s in $Dataset.Sessions) {
-        $i = Get-ClampedSessionInterval -Session $s -WindowStartUtc $WindowStartUtc `
-            -WindowEndUtc $WindowEndUtc -NowUtc $NowUtc
+        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
+            $script:ReportCancellationSource.IsCancellationRequested) {
+            throw (New-Object System.OperationCanceledException 'The run was canceled.')
+        }
+        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
         if ($i) {
             $sessionInfo[[string]$s.SessionKey] = [pscustomobject]@{
                 UserId      = [string]$s.UserId
@@ -2590,9 +4212,29 @@ function Get-ClientDeviceBreakdown {
     }
 
     $eligible = @{}
+
+    # Cancellation is checked on a counter rather than every iteration: the
+    # counter increment and mask test below run every iteration regardless
+    # of the interval -- measured ~1.56us added per iteration, ~0.3% against
+    # the ~530us/session-iteration work rate (2,384s / 4.5M iterations,
+    # measured at 500k across the three default windows) -- and only the
+    # rare IsCancellationRequested read is gated by the interval.
+    #
+    # 0xFFFF (65,536) was wrong: that number is the CHECK's own cost over
+    # 65,536 iterations (65,536 x 1.56us =~ 0.1s), mislabelled here as the
+    # cost of the WORK between checkpoints. At the real work rate, 65,536
+    # iterations is ~35s between checkpoints -- confirmed at 26.17s on real
+    # sessions -- which leaves Cancel looking dead for half a minute against
+    # the "reacts within seconds" requirement this task exists for. 0x7FF
+    # (2,048) brings that to ~1.1s while leaving the per-iteration tax
+    # exactly where it was.
+    $cancelTick = 0
     foreach ($s in $Dataset.Sessions) {
-        $i = Get-ClampedSessionInterval -Session $s -WindowStartUtc $WindowStartUtc `
-            -WindowEndUtc $WindowEndUtc -NowUtc $NowUtc
+        if ((++$cancelTick -band 0x7FF) -eq 0 -and $script:ReportCancellationSource -and
+            $script:ReportCancellationSource.IsCancellationRequested) {
+            throw (New-Object System.OperationCanceledException 'The run was canceled.')
+        }
+        $i = Get-ClampedSessionIntervalCore $s $WindowStartUtc $WindowEndUtc $NowUtc
         if ($i) { $eligible[[string]$s.SessionKey] = $true }
     }
 
@@ -2619,7 +4261,7 @@ function Get-ClientDeviceBreakdown {
     }
 }
 
-function Invoke-AuditAnalysis {
+function Invoke-ReportAnalysis {
     <#
     .SYNOPSIS
         Runs every enabled analysis for every requested window.
@@ -2629,14 +4271,22 @@ function Invoke-AuditAnalysis {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][pscustomobject] $Dataset,
-        [Parameter(Mandatory)][pscustomobject] $Config
+        [Parameter(Mandatory)][pscustomobject] $Config,
+        # Called as the analysis advances, with a stage description and an
+        # overall percentage. Optional; every existing caller omits it.
+        #
+        # At 500,000 sessions the analysis runs for over two hours and, until
+        # this existed, said nothing between "Analyzing the 90 day window..."
+        # and the finished report. Silence that long is indistinguishable from
+        # a hang. Same contract the fetch already uses.
+        [scriptblock] $ProgressAction
     )
 
     $now = $Config.RunStartUtc
     $available = if ($Dataset.Preflight) { [int] $Dataset.Preflight.AvailableDays } else { [int]::MaxValue }
 
     # The instant from which the site's history is actually present.
-    # HistoryStartUtc is what Invoke-AuditPreflight derives from the oldest
+    # HistoryStartUtc is what Invoke-ReportPreflight derives from the oldest
     # ENDED session (the only data grooming can remove); OldestSessionUtc --
     # the oldest session START, which a single months-old still-running
     # desktop can set on its own -- is the fallback for a Preflight object
@@ -2651,18 +4301,57 @@ function Invoke-AuditAnalysis {
         }
     }
 
+    # Per-export coverage, present only for a consolidation. Used to say, per
+    # window, whether every contributing site actually has data going back
+    # that far -- which truncation cannot express, because the set as a whole
+    # may span 90 days while one member covers 10.
+    # Per SITE, not per export. One site contributing six monthly exports
+    # covers six months between them; judged one export at a time, every one
+    # of them falls short of a 180-day window and the report told an operator
+    # their complete total was a lower bound.
+    $coverage = @()
+    if ($Dataset.PSObject.Properties['Consolidation'] -and $Dataset.Consolidation -and
+        $Dataset.Consolidation.PSObject.Properties['SiteCoverage']) {
+        $coverage = @($Dataset.Consolidation.SiteCoverage)
+    }
+
     # Resolved once for the whole run: the warning inside it must not repeat
     # per window, and re-resolving per concurrency bucket would be measurable
     # on a 90-day window.
-    $siteZone = Resolve-AuditTimeZone -TimeZoneId $Config.DisplayTimeZoneId
+    $siteZone = Resolve-ReportTimeZone -TimeZoneId $Config.DisplayTimeZoneId
+
+    # Reported by window rather than by session: a window is the unit a
+    # reader recognises. Percentage is windows COMPLETED, so it starts at 0
+    # and the final report after the loop is the only one that says 100.
+    $windowOrdinal = 0
+    $windowTotal = [math]::Max(1, @($Config.Days).Count)
 
     $windows = foreach ($days in $Config.Days) {
 
         $start = $now.AddDays(-1 * $days)
         $isTruncated = $days -gt $available
 
-        # When history is shorter than the requested window, analyse only the
-        # span that actually exists. Analysing an empty stretch would drag the
+        # Sites whose data does not reach back to this window's start, counting
+        # all of a site's exports together. Their people are counted only over
+        # the part that is covered, so the total is a lower bound.
+        $partial = $null
+        if ($coverage.Count -gt 0) {
+            $short = @($coverage | Where-Object { $_.ContiguousStartUtc -gt $start })
+            $partial = [pscustomobject]@{
+                ShortExports  = $short.Count
+                TotalExports  = $coverage.Count
+                Unconfirmed   = @($coverage | Where-Object { -not $_.HistoryConfirmed }).Count
+                ShortSites    = [object[]] @($short | ForEach-Object {
+                    [pscustomobject]@{
+                        EnvironmentLabel = $_.Label
+                        CoveredDays = [int][math]::Floor(($now - $_.ContiguousStartUtc).TotalDays)
+                    }
+                })
+            }
+        }
+
+        # When history is shorter than the requested window, analyze only the
+        # span that actually exists. Analyzing an empty stretch would drag the
         # percentiles toward zero and quietly flatter the customer's numbers.
         $effectiveStart = $start
         if ($isTruncated -and $historyStart) {
@@ -2671,7 +4360,7 @@ function Invoke-AuditAnalysis {
 
         # Defensive clamp: the history start is only ever expected to be at or
         # before $now, but it is computed by a prior, separate call
-        # (Invoke-AuditPreflight) against whatever "now" that call used. A
+        # (Invoke-ReportPreflight) against whatever "now" that call used. A
         # dataset built against a different Config -- or simply stale data
         # reused across runs -- could carry a HistoryStartUtc later than
         # this run's $now, which would make effectiveStart later than $now
@@ -2680,14 +4369,42 @@ function Invoke-AuditAnalysis {
         # instead of a hard failure.
         if ($effectiveStart -gt $now) { $effectiveStart = $now }
 
-        Write-AuditLog -Level Info -Message "Analysing the $days day window..."
+        Write-ReportLog -Level Info -Message "Analyzing the $days day window..."
 
+        # Three heavy steps per window, each a full pass over every session.
+        # Reporting only between windows left 72-minute gaps at 500k, so each
+        # step reports as it begins.
+        #
+        # [void]: this loop's output becomes $windows, so anything the
+        # caller's scriptblock returns would be collected as a window object.
+        $stepTotal = $windowTotal * 3
+        # Captured as a variable, not resolved by name inside the closure:
+        # a .GetNewClosure() scriptblock's command lookup falls back to
+        # global when a name doesn't resolve locally, which has shipped three
+        # separate bugs in this project. & $fnAssertNotCancelled always calls
+        # the function actually loaded here, never a stale global.
+        $fnAssertNotCancelled = ${function:Assert-NotCancelled}
+        $report = {
+            param([string] $What, [int] $StepInWindow)
+            & $fnAssertNotCancelled
+            if ($ProgressAction) {
+                $done = ($windowOrdinal * 3) + $StepInWindow
+                [void] (& $ProgressAction "$days-day window: $What" `
+                    ([int] (100 * $done / $stepTotal)))
+            }
+        }.GetNewClosure()
+
+        & $report 'unique users' 0
         $users = Get-UniqueUserStats -Sessions $Dataset.Sessions -WindowStartUtc $effectiveStart `
             -WindowEndUtc $now -NowUtc $now
+
+        & $report 'concurrency peak' 1
         $peak = Get-PeakConcurrency -Sessions $Dataset.Sessions -WindowStartUtc $effectiveStart `
             -WindowEndUtc $now -NowUtc $now
+        & $report 'concurrency over time' 2
         $series = @(Get-ConcurrencySeries -Sessions $Dataset.Sessions -WindowStartUtc $effectiveStart `
             -WindowEndUtc $now -NowUtc $now -IntervalMinutes 15)
+        $windowOrdinal++
 
         $counts = @($series | ForEach-Object { $_.Count })
 
@@ -2745,13 +4462,21 @@ function Invoke-AuditAnalysis {
         # `if ($Config.Include...) { $x = @(Get-... ...) }` form below has
         # only ONE implicit-output boundary -- the @() at the call site -- so
         # it does not suffer the same collapse.
+        # Each breakdown below is its own full sweep of every session in the
+        # window, and the last cancellation point before this was the third
+        # & $report call above -- so each gets its own Assert-NotCancelled
+        # immediately before it runs, rather than one checkpoint shared
+        # across all of them, which would leave whichever runs longest
+        # (typically Get-DeliveryGroupBreakdown) unbounded on its own.
         $deliveryGroups = $null
         if ($Config.IncludeDeliveryGroups) {
+            Assert-NotCancelled
             $deliveryGroups = @(Get-DeliveryGroupBreakdown -Dataset $Dataset -WindowStartUtc $effectiveStart -WindowEndUtc $now -NowUtc $now)
         }
 
         $applications = $null
         if ($Config.IncludeApplications) {
+            Assert-NotCancelled
             $applications = @(Get-ApplicationBreakdown -Dataset $Dataset -WindowStartUtc $effectiveStart -WindowEndUtc $now -NowUtc $now)
         }
 
@@ -2763,6 +4488,7 @@ function Invoke-AuditAnalysis {
         # nested-`$(if...)` shape this line previously used.
         $dailyTrend = $null
         if ($Config.IncludeTrend) {
+            Assert-NotCancelled
             $dailyTrend = @(Get-DailyTrend -Sessions $Dataset.Sessions -WindowStartUtc $effectiveStart -WindowEndUtc $now -NowUtc $now)
         }
 
@@ -2772,6 +4498,9 @@ function Invoke-AuditAnalysis {
             WindowEndUtc       = $now
             IsTruncated        = $isTruncated
             AvailableDays      = $available
+            # Null for a single site. For a consolidation, how many
+            # contributing exports fall short of this window.
+            PartialCoverage    = $partial
             UniqueUsers        = $users.UniqueUsers
             UniqueUserIds      = $users.UniqueUserIds
             AnonymousSessions  = $users.AnonymousSessions
@@ -2779,15 +4508,28 @@ function Invoke-AuditAnalysis {
             TotalSessions      = $users.TotalSessions
             Concurrency        = $concurrency
             DeliveryGroups     = $deliveryGroups
+            # Assert-NotCancelled as the first statement of each branch, not a
+            # shared checkpoint before both: same reasoning as DeliveryGroups
+            # / Applications / DailyTrend above. Assert-NotCancelled has no
+            # pipeline output, so it does not disturb which value this
+            # subexpression returns.
             SessionTypes       = $(if ($Config.IncludeApplications) {
+                Assert-NotCancelled
                 Get-SessionTypeBreakdown -Sessions $Dataset.Sessions -WindowStartUtc $effectiveStart -WindowEndUtc $now -NowUtc $now
             } else { $null })
             Applications       = $applications
             ClientDevices      = $(if ($Config.IncludeClientDevices) {
+                Assert-NotCancelled
                 Get-ClientDeviceBreakdown -Dataset $Dataset -WindowStartUtc $effectiveStart -WindowEndUtc $now -NowUtc $now
             } else { $null })
             DailyTrend         = $dailyTrend
         }
+    }
+
+    if ($ProgressAction) {
+        # The only report that says 100. A bar that never reaches it is
+        # never dismissed.
+        [void] (& $ProgressAction 'Analysis complete' 100)
     }
 
     # Assigned to a plain local BEFORE the object literal below, with @()
@@ -2805,6 +4547,13 @@ function Invoke-AuditAnalysis {
         GeneratedUtc     = $now
         Config           = $Config
         Preflight        = $Dataset.Preflight
+        # Which site this is. Carried onto the analysis rather than read from
+        # the dataset by the report and the export separately, so both name
+        # the same site by construction.
+        SiteIdentity     = $Dataset.SiteIdentity
+        # Present only on a consolidated run; the report omits its section
+        # entirely when this is absent.
+        Consolidation    = $(if ($Dataset.PSObject.Properties['Consolidation']) { $Dataset.Consolidation } else { $null })
         # Entities whose fetch came back knowingly incomplete or unbounded.
         # Surfaced onto the analysis so the report can warn next to the
         # figures they affect -- the same reason retention truncation gets an
@@ -2829,7 +4578,7 @@ function Invoke-AuditAnalysis {
 #  Brand
 #
 #  The Citrix 2026 v1.2 brand system, as tokens. Values are documented in
-#  docs/BRAND.md; that file is the authority and this one is its code form.
+#  docs/REFERENCE.md section 8; that file is the authority and this one is its code form.
 #
 #  Fonts and logos are substituted in at build time as base64, so the
 #  distributed script carries them and the generated report opens on an
@@ -2864,7 +4613,7 @@ function Get-BrandPalette {
     .DESCRIPTION
         Cobalt 70 is #0B2168. The printed style guide labels it #00236E, but
         its own RGB value (11/33/104) and the PowerPoint theme's dk2 both give
-        #0B2168, so the printed hex is treated as a typo. See docs/BRAND.md.
+        #0B2168, so the printed hex is treated as a typo. See docs/REFERENCE.md section 8.
     #>
     [CmdletBinding()]
     [OutputType([hashtable])]
@@ -2906,7 +4655,7 @@ function ConvertFrom-HexColor {
 function Get-RelativeLuminance {
     <#
     .SYNOPSIS
-        WCAG relative luminance of a colour.
+        WCAG relative luminance of a color.
     #>
     [CmdletBinding()]
     [OutputType([double])]
@@ -2923,7 +4672,7 @@ function Get-RelativeLuminance {
 function Get-ContrastRatio {
     <#
     .SYNOPSIS
-        WCAG contrast ratio between two colours, from 1 to 21.
+        WCAG contrast ratio between two colors, from 1 to 21.
     .DESCRIPTION
         The brand requires AA at minimum: 4.5:1 for normal text, 3:1 for large.
         The test suite asserts every pairing the report uses, so a later palette
@@ -3186,8 +4935,8 @@ tbody tr:last-child td { border-bottom: none; }
 
   body { background: #FFFFFF; }
 
-  /* Preserve backgrounds and accent colours. Without this, a browser's
-     default print behaviour is to drop background colours to save ink -
+  /* Preserve backgrounds and accent colors. Without this, a browser's
+     default print behavior is to drop background colors to save ink -
      a truncation banner that prints as plain white text on white loses
      the urgency it exists to carry, and the KPI accent border and header
      band go with it. Set broadly (inherited) rather than only on
@@ -3202,10 +4951,10 @@ tbody tr:last-child td { border-bottom: none; }
   .no-print { display: none !important; }
 
   .card, .kpi, .kpi-row { break-inside: avoid; border-color: #CCCCCC; }
-  /* A card taller than a single page cannot honour break-inside: avoid -
+  /* A card taller than a single page cannot honor break-inside: avoid -
      there is no page it fits on whole. Neither .card nor its children set
      overflow: hidden anywhere, so the degrade is the browser's normal
-     fragmentation behaviour (the card starts on a fresh page and its
+     fragmentation behavior (the card starts on a fresh page and its
      content flows across as many pages as it needs), never clipping. */
 
   h1, h2, h3 { break-after: avoid; }
@@ -3247,7 +4996,7 @@ tbody tr:last-child td { border-bottom: none; }
 #  library, so the report has no external dependency, opens on an air-gapped
 #  machine, and prints correctly.
 #
-#  Colour is never used to carry category identity on its own here. Bar
+#  Color is never used to carry category identity on its own here. Bar
 #  charts (the common case: delivery groups, applications, users) draw every
 #  bar in the same brand-primary hue - the label carries identity, the bar
 #  length carries the value. The one chart that legitimately compares two
@@ -3256,16 +5005,16 @@ tbody tr:last-child td { border-bottom: none; }
 #  the white card the charts sit on and separate cleanly under deuteranopia
 #  and tritanopia simulation - and it keeps per-bar value labels and a
 #  legend as the secondary encoding that makes a two-hue comparison safe for
-#  colour-blind readers. Three of the twelve palette tokens (Mint 40,
+#  color-blind readers. Three of the twelve palette tokens (Mint 40,
 #  Slate 20, Aether 20) are too light to read as a data mark on a light
 #  surface at all, even though they are legitimate brand background and
 #  accent tints elsewhere in the stylesheet; Get-ChartSeriesColor excludes
-#  them for that reason. See docs/BRAND.md and the Task 12 report for the
+#  them for that reason. See docs/REFERENCE.md section 8 and the Task 12 report for the
 #  measured contrast ratios behind this.
 # ============================================================================
 
 # Minimum horizontal gap, in pixels, a New-SvgAreaChart x-axis label is
-# allowed from its neighbour. The plot width divided by this gap gives the
+# allowed from its neighbor. The plot width divided by this gap gives the
 # label count, so it scales with -Width rather than a hardcoded count that
 # would crowd a narrower chart or under-fill a wider one. Chosen so the
 # default 1080px chart (plot width ~1012px after padding) lands around 7
@@ -3291,7 +5040,7 @@ function ConvertTo-HtmlEncoded {
         could make the page display something other than what it contains.
 
         A label that is empty, or becomes whitespace-only once any bidi
-        controls are stripped, is normalised to the empty string: it carries
+        controls are stripped, is normalized to the empty string: it carries
         no visible identity, and callers treat an empty result the same as
         an absent label (e.g. omitting a chart's <title>) rather than
         rendering an element with nothing readable in it.
@@ -3351,7 +5100,7 @@ function Get-TruncatedLabel {
 function Get-ChartSeriesColor {
     <#
     .SYNOPSIS
-        Colour for one chart series, drawn from the mark-safe subset of the
+        Color for one chart series, drawn from the mark-safe subset of the
         brand palette.
     .DESCRIPTION
         Only four of the twelve brand tokens are legible as a data mark on
@@ -3366,7 +5115,7 @@ function Get-ChartSeriesColor {
         ramp does NOT wrap around to reuse an earlier hue - cycling a
         palette by index is a data-visualisation anti-pattern in its own
         right, and here it would silently give two unrelated series the
-        same colour. Instead the last mark-safe hue is returned, and the
+        same color. Instead the last mark-safe hue is returned, and the
         caller is expected to have grouped any remainder into an "Other"
         bucket before it gets this far. Every caller in this project caps
         its series count at or below the ramp length already, so this is a
@@ -3545,7 +5294,7 @@ function New-SvgBarChart {
         was cut off. The full name is always available in the report's
         adjacent data table.
 
-        Every bar is drawn in the same colour, Cobalt 50. Bars in this chart
+        Every bar is drawn in the same color, Cobalt 50. Bars in this chart
         show magnitude, not identity - the label beside each bar already
         carries identity, so colouring bars individually would add nothing
         and would break the brand's four-hue-per-composition rule the moment
@@ -3593,8 +5342,8 @@ $titleEl  <text x="$($Width/2)" y="34" text-anchor="middle" font-size="14" fill=
     $max = ($data | ForEach-Object { [double] $_.$ValueProperty } | Measure-Object -Maximum).Maximum
     if ($max -le 0) { $max = 1 }
 
-    # Every bar carries the same colour deliberately - see the function's
-    # .DESCRIPTION. Do not colour bars by index.
+    # Every bar carries the same color deliberately - see the function's
+    # .DESCRIPTION. Do not color bars by index.
     $barColor = $p['Cobalt50']
 
     $rows = for ($i = 0; $i -lt $data.Count; $i++) {
@@ -3628,7 +5377,7 @@ function New-SvgGroupedBarChart {
         pair was validated for CVD separation (Delta E 21.6 deutan, 8.9
         tritan, 22.7 normal vision) and both clear 3:1 contrast against the
         white card, which is what makes a two-hue comparison safe for
-        colour-blind readers here - together with the per-bar value labels
+        color-blind readers here - together with the per-bar value labels
         and legend this chart keeps as the secondary encoding. It also keeps
         the composition inside the brand's four-hue-per-composition rule.
 
@@ -3774,6 +5523,64 @@ function Format-LocalTime {
     }
 }
 
+function New-PartialCoverageNotice {
+    <#
+    .SYNOPSIS
+        The banner shown when some contributing exports do not reach back as
+        far as the window being reported.
+    .DESCRIPTION
+        Distinct from truncation, and it has to be, because the two say
+        different things. Truncation means "this site's history is shorter
+        than the window". Partial coverage means "the set spans the window,
+        but not every member does" -- so the figures are a lower bound even
+        though the consolidated span looks complete.
+
+        Without this, a consolidated report claimed full 90-day coverage with
+        nothing truncated while one of its three exports held 10 days of
+        history and had all three of its own windows marked truncated. The
+        headline read as a complete 90-day count.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][AllowNull()] $Window)
+
+    if (-not $Window) { return '' }
+    if (-not $Window.PSObject.Properties['PartialCoverage']) { return '' }
+    $pc = $Window.PartialCoverage
+    if (-not $pc) { return '' }
+    if ([int]$pc.ShortExports -le 0 -and [int]$pc.Unconfirmed -le 0) { return '' }
+
+    $parts = New-Object System.Collections.Generic.List[string]
+
+    if ([int]$pc.ShortExports -gt 0) {
+        $rows = (@($pc.ShortSites) | ForEach-Object {
+            "<li>{0} &mdash; {1} day(s) of history</li>" -f `
+                (ConvertTo-HtmlEncoded -Text ([string]$_.EnvironmentLabel)), [int]$_.CoveredDays
+        }) -join "`n"
+        $parts.Add(@"
+  <strong>$([int]$pc.ShortExports) of $([int]$pc.TotalExports) sites do not
+  cover this $($Window.Days)-day window.</strong>
+  Those sites are counted only over the period they do cover, so this total is
+  a <strong>lower bound</strong>: the real $($Window.Days)-day figure across
+  every site is higher than shown.
+  <ul>
+$rows
+  </ul>
+"@)
+    }
+
+    if ([int]$pc.Unconfirmed -gt 0) {
+        $parts.Add(@"
+  <p>$([int]$pc.Unconfirmed) site(s) have exports that do not record how much
+  history they held, so their coverage of this window is
+  <strong>unconfirmed</strong>. Those exports were produced before the report
+  recorded it; re-export those sites to confirm.</p>
+"@)
+    }
+
+    return "<div class=""truncated"">`n" + ($parts -join "`n") + "`n</div>`n"
+}
+
 function New-TruncationNotice {
     <#
     .SYNOPSIS
@@ -3781,7 +5588,7 @@ function New-TruncationNotice {
     .DESCRIPTION
         Rendered next to the figures it affects rather than as a footnote,
         because an under-counted window is invisible in the output otherwise
-        and would understate the customer's licence need.
+        and would understate the customer's license need.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -3808,7 +5615,7 @@ function New-RetentionUncertainNotice {
     .SYNOPSIS
         The banner shown when retention itself could not be confirmed.
     .DESCRIPTION
-        Invoke-AuditPreflight normally measures retention from the oldest
+        Invoke-ReportPreflight normally measures retention from the oldest
         ENDED session, because grooming only ever removes ended sessions.
         When a site has zero ended sessions within retention -- a handful of
         always-connected persistent desktops on a small, non-Premium site is
@@ -3824,7 +5631,7 @@ function New-RetentionUncertainNotice {
         coverage claim that was never actually established. This banner
         exists to carry that caveat into the report itself, the same way
         New-TruncationNotice carries a confirmed shortfall into it, because a
-        warning that only reaches audit.log never reaches the customer who
+        warning that only reaches usage-report.log never reaches the customer who
         acts on the report.
     #>
     [CmdletBinding()]
@@ -3860,7 +5667,7 @@ function New-FetchWarningNotice {
     .DESCRIPTION
         An arbitrarily truncated fetch produces an under-count that looks
         exactly like a complete figure. Before this existed the only trace was
-        a line in audit.log, which nobody reading the report ever sees -- the
+        a line in usage-report.log, which nobody reading the report ever sees -- the
         same silent-undercount failure the retention banner exists to prevent,
         applied to Connections and ApplicationInstances instead of Sessions.
 
@@ -3932,6 +5739,7 @@ function New-WindowSection {
     &rarr; $(Format-LocalTime -Utc $Window.WindowEndUtc -TimeZoneId $TimeZoneId)
   </p>
   $(New-TruncationNotice -Window $Window)
+  $(New-PartialCoverageNotice -Window $Window)
 
   <div class="kpi-row">
     <div class="kpi">
@@ -3940,12 +5748,12 @@ function New-WindowSection {
       <div class="note">Distinct users with at least one session</div>
     </div>
     <div class="kpi">
-      <div class="label">Peak concurrent</div>
+      <div class="label">Peak concurrent sessions</div>
       <div class="value">$($c.Peak)</div>
       <div class="note">$(Format-LocalTime -Utc $c.PeakAtUtc -TimeZoneId $TimeZoneId)</div>
     </div>
     <div class="kpi">
-      <div class="label">95th percentile concurrent</div>
+      <div class="label">95th percentile concurrent sessions</div>
       <div class="value">$([math]::Round($c.P95, 0))</div>
       <div class="note">Business hours ($bizLabel): $([math]::Round($c.BusinessP95, 0))</div>
     </div>
@@ -3997,7 +5805,7 @@ function New-WindowSection {
   $(New-SvgBarChart -Items $chartItems -Width 1080 -Label "Unique users by delivery group over $($Window.Days) days")
   <div class="scroll-x">
   <table>
-    <thead><tr><th>Delivery group</th><th class="num">Unique users</th><th class="num">Peak concurrent</th><th class="num">Sessions</th></tr></thead>
+    <thead><tr><th>Delivery group</th><th class="num">Unique users</th><th class="num">Peak concurrent sessions</th><th class="num">Sessions</th></tr></thead>
     <tbody>$rows</tbody>
   </table>
   </div>
@@ -4071,6 +5879,281 @@ function New-WindowSection {
     return ($sections -join "`n")
 }
 
+function New-SiteIdentitySection {
+    <#
+    .SYNOPSIS
+        Renders the block that says which site produced this report.
+    .DESCRIPTION
+        Placed after the figures rather than before them because it answers a
+        different question. The figures say what happened; this says where the
+        figures came from, which only starts to matter when a report is read
+        next to another one.
+
+        Returns an empty string when there is nothing to say, so an older
+        export or a run whose identification failed simply omits the section
+        instead of showing an empty one.
+    #>
+    [CmdletBinding()]
+    param(
+        $Identity,
+        [string] $TimeZoneId
+    )
+
+    if (-not $Identity) { return '' }
+
+    $rows = New-Object System.Collections.Generic.List[string]
+
+    $isCloud = [bool] $Identity.IsCloud
+
+    if ($Identity.QueriedController) {
+        $rows.Add("      <tr><td>Delivery Controller queried</td><td>$(ConvertTo-HtmlEncoded -Text ([string]$Identity.QueriedController))</td></tr>")
+    }
+
+    # On Citrix Cloud the customer ID IS the site's identity. Without it a
+    # cloud report does not say which tenant produced it, which is exactly the
+    # question this section exists to answer.
+    if ($Identity.CustomerId) {
+        $rows.Add("      <tr><td>Citrix Cloud customer ID</td><td><code>$(ConvertTo-HtmlEncoded -Text ([string]$Identity.CustomerId))</code></td></tr>")
+    }
+
+    $controllers = @($Identity.ControllerFqdns)
+    if ($controllers.Count -gt 0) {
+        # Worth naming individually rather than counting: the value here is
+        # seeing WHICH hosts, not how many.
+        #
+        # The label differs by environment because the underlying field does.
+        # On-premises these are the customer's Delivery Controllers. On Citrix
+        # Cloud the same field returns Cloud Connector identifiers and Citrix's
+        # own control-plane hosts -- verified against a live tenant -- and
+        # calling those Delivery Controllers would tell the reader something
+        # untrue about their own estate.
+        $list = ($controllers | ForEach-Object { ConvertTo-HtmlEncoded -Text ([string]$_) }) -join '<br>'
+        $label = if ($isCloud) {
+            "Registration hosts ($($controllers.Count))"
+        } elseif ($controllers.Count -eq 1) {
+            'Delivery Controller in this site'
+        } else {
+            "Delivery Controllers in this site ($($controllers.Count))"
+        }
+        $rows.Add("      <tr><td>$label</td><td>$list</td></tr>")
+        if ($isCloud) {
+            $rows.Add('      <tr><td></td><td class="footnote">On Citrix Cloud these are the Cloud Connectors and Citrix control-plane hosts the machines are registered against, not Delivery Controllers you operate.</td></tr>')
+        }
+    }
+
+    if ($Identity.ProductVersion) {
+        $rows.Add("      <tr><td>Product version</td><td>$(ConvertTo-HtmlEncoded -Text ([string]$Identity.ProductVersion))</td></tr>")
+    }
+
+    $agents = @($Identity.Agents | Where-Object { $_.ComponentId })
+    if ($agents.Count -gt 0) {
+        $ids = ($agents | ForEach-Object { ConvertTo-HtmlEncoded -Text ([string]$_.ComponentId) }) -join '<br>'
+        $rows.Add("      <tr><td>Component identifier</td><td><code>$ids</code></td></tr>")
+    }
+
+    if ($Identity.ResourceLocationName -or $Identity.ResourceLocationId) {
+        $rl = if ($Identity.ResourceLocationName) { [string]$Identity.ResourceLocationName } else { [string]$Identity.ResourceLocationId }
+        $rows.Add("      <tr><td>Resource location</td><td>$(ConvertTo-HtmlEncoded -Text $rl)</td></tr>")
+    }
+
+    $zones = @($Identity.Zones)
+    if ($zones.Count -gt 0) {
+        $zl = ($zones | ForEach-Object {
+            $n = if ($_.Name) { [string]$_.Name } else { [string]$_.Uid }
+            ConvertTo-HtmlEncoded -Text $n
+        }) -join '<br>'
+        $rows.Add("      <tr><td>Zones</td><td>$zl</td></tr>")
+    }
+
+    # Reported only when it is large enough to be a measurement rather than
+    # noise. The HTTP Date header carries one-second resolution and the round
+    # trip adds its own, so a value inside a couple of seconds says nothing.
+    if ($null -ne $Identity.ClockSkewSeconds) {
+        $skew = [double]$Identity.ClockSkewSeconds
+        if ([math]::Abs($skew) -ge 2) {
+            $direction = if ($skew -gt 0) { 'ahead of' } else { 'behind' }
+            $mins = [math]::Round([math]::Abs($skew) / 60, 1)
+            $rows.Add("      <tr><td>Site clock</td><td>$mins minute(s) $direction the machine that ran this report. Combining this site's concurrency with another site's would be affected by that difference.</td></tr>")
+        } else {
+            $rows.Add('      <tr><td>Site clock</td><td>Agrees with the machine that ran this report.</td></tr>')
+        }
+    }
+
+    if ($rows.Count -eq 0) { return '' }
+
+    $notes = @($Identity.Notes)
+    $noteHtml = ''
+    if ($notes.Count -gt 0) {
+        $items = ($notes | ForEach-Object { "    <li>$(ConvertTo-HtmlEncoded -Text ([string]$_))</li>" }) -join "`n"
+        $noteHtml = @"
+
+  <p class="footnote">Notes on this identification:</p>
+  <ul class="footnote">
+$items
+  </ul>
+"@
+    }
+
+    $rowHtml = $rows -join "`n"
+
+    @"
+
+<div class="card">
+  <h2>Which site this is</h2>
+  <p>These details identify the environment the figures above were read from.
+  They matter when this report is read alongside another one: two reports have
+  to be recognizable as the same site or as different sites before their user
+  counts can be combined, and a user active in two sites must not be counted
+  twice. They contain no user data.</p>
+  <div class="scroll-x">
+  <table>
+    <tbody>
+$rowHtml
+    </tbody>
+  </table>
+  </div>$noteHtml
+</div>
+"@
+}
+
+function New-ConsolidationSection {
+    <#
+    .SYNOPSIS
+        Renders how a consolidated figure was reached.
+    .DESCRIPTION
+        A consolidated number is only as trustworthy as its weakest match, so
+        the report carries its own provenance: the inputs, the count before
+        and after bridging, every bridged identity individually, anything
+        rejected, and any period no export covered.
+
+        Returns an empty string for a single-site report, so the section
+        simply does not appear rather than appearing empty.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()] $Consolidation)
+
+    if (-not $Consolidation) { return '' }
+
+    $inputRows = (@($Consolidation.Inputs) | ForEach-Object {
+        '      <tr><td>{0}</td><td>{1} to {2}</td><td>{3}</td><td>{4}</td></tr>' -f `
+            (ConvertTo-HtmlEncoded -Text ([string]$_.EnvironmentLabel)),
+            (ConvertTo-HtmlEncoded -Text ([string]$_.WindowStartUtc)),
+            (ConvertTo-HtmlEncoded -Text ([string]$_.WindowEndUtc)),
+            $(if ([bool]$_.Anonymized) { 'anonymized' } else { 'raw identifiers' }),
+            (ConvertTo-HtmlEncoded -Text ([string]$_.ToolVersion))
+    }) -join "`n"
+
+    # Both figures, always. The gap between them is exactly the amount of
+    # deduplication resting on a name match rather than an identifier match.
+    $bridgeDelta = [int]$Consolidation.SidOnlyCount - [int]$Consolidation.FinalCount
+
+    $bridgeHtml = ''
+    if (@($Consolidation.Bridges).Count -gt 0) {
+        $items = (@($Consolidation.Bridges) | ForEach-Object {
+            $suspect = $(if ([bool]$_.IsSuspect) { ' &mdash; <strong>suspect: verify this one</strong>' } else { '' })
+            '    <li>{0} joined {1} account(s) across {2} forest(s){3}</li>' -f `
+                (ConvertTo-HtmlEncoded -Text ([string]$_.BridgeKey)),
+                @($_.UserKeys).Count, @($_.ForestKeys).Count, $suspect
+        }) -join "`n"
+        $bridgeHtml = @"
+
+  <h3>Identities joined by matching user principal name</h3>
+  <p>Each of these joined two or more directory accounts into one person on
+  the strength of a shared user principal name, not a shared security
+  identifier. That is a weaker claim: the same evidence is produced by one
+  person holding accounts in two directories and by two different people who
+  happen to share a name. Check each one.</p>
+  <ul>
+$items
+  </ul>
+"@
+    }
+
+    $gapHtml = ''
+    if (@($Consolidation.CoverageGaps).Count -gt 0) {
+        $gapItems = (@($Consolidation.CoverageGaps) | ForEach-Object {
+            '    <li>{0:yyyy-MM-dd} to {1:yyyy-MM-dd}</li>' -f $_.FromUtc, $_.ToUtc
+        }) -join "`n"
+        $gapHtml = @"
+
+<div class="truncated">
+  <strong>No export covers part of the reported period.</strong>
+  Nothing was measured during:
+  <ul>
+$gapItems
+  </ul>
+  Every figure spanning a gap is a <strong>lower bound</strong>, not a count.
+</div>
+"@
+    }
+
+    $rejectHtml = ''
+    if (@($Consolidation.Rejected).Count -gt 0) {
+        $rejectItems = (@($Consolidation.Rejected) | ForEach-Object {
+            '    <li>{0} &mdash; {1}</li>' -f (ConvertTo-HtmlEncoded -Text ([string]$_.Path)),
+                (ConvertTo-HtmlEncoded -Text ([string]$_.Reason))
+        }) -join "`n"
+        $rejectHtml = @"
+
+<div class="truncated">
+  <strong>Some inputs were not used.</strong>
+  <ul>
+$rejectItems
+  </ul>
+</div>
+"@
+    }
+
+    $repeatText = $(if ([int]$Consolidation.RepeatedSites -gt 0) {
+        ", $($Consolidation.RepeatedSites) of them exported more than once"
+    } else { '' })
+
+    $bridgeText = $(if ($bridgeDelta -gt 0) {
+        "The further reduction of $bridgeDelta below rests on name matching instead, and every one of those joins is listed individually."
+    } else { 'No further reduction came from name matching.' })
+
+    @"
+$gapHtml$rejectHtml
+<div class="card">
+  <h2>How this consolidated figure was reached</h2>
+  <div class="scroll-x">
+  <table>
+    <thead><tr><th>Export</th><th>Period covered</th><th>Identifiers</th><th>Written by</th></tr></thead>
+    <tbody>
+$inputRows
+    </tbody>
+  </table>
+  </div>
+
+  <h3>Deduplication</h3>
+  <div class="scroll-x">
+  <table>
+    <tbody>
+      <tr><td>User records across all inputs</td><td>$($Consolidation.NaiveCount)</td></tr>
+      <tr><td>After matching on security identifier</td><td>$($Consolidation.SidOnlyCount)</td></tr>
+      <tr><td>After also matching on user principal name</td><td><strong>$($Consolidation.FinalCount)</strong></td></tr>
+      <tr><td>Sites represented</td><td>$($Consolidation.SitesSeen)$repeatText</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Matching on the security identifier is exact: the same directory account
+  reports the same identifier in every site, which was verified across an
+  on-premises site and a Citrix Cloud site. $bridgeText</p>
+$bridgeHtml
+  <p class="footnote">Each export covers the period its own site retained.
+  Where that is shorter than a reporting window, the window is marked above as
+  covering only part of the estate, and its total is a lower bound rather than
+  a count.</p>
+  <p class="footnote">Per-delivery-group, per-application and per-device
+  breakdowns are not available in a consolidated report. The merge export
+  carries identity and time only, by design, so that the file which travels
+  between sites holds the least it can. Run a report against a single site for
+  those breakdowns.</p>
+</div>
+"@
+}
+
 function New-HtmlReport {
     <#
     .SYNOPSIS
@@ -4082,6 +6165,12 @@ function New-HtmlReport {
 
     $cfg = $Analysis.Config
     $tz = $cfg.DisplayTimeZoneId
+
+    # Present only on a consolidated run. Absent on the single-site
+    # path, where New-ConsolidationSection returns an empty string and
+    # the section does not appear at all.
+    $consolidation = $null
+    if ($Analysis.PSObject.Properties['Consolidation']) { $consolidation = $Analysis.Consolidation }
     $widest = $Analysis.Windows | Sort-Object Days -Descending | Select-Object -First 1
 
     $demoBanner = if ($Analysis.IsDemo) {
@@ -4100,7 +6189,7 @@ function New-HtmlReport {
     # is a plain fact about how the whole run was transported, so it belongs
     # in its own banner with its own accurate wording -- reusing the generic
     # "some data was not fetched completely" copy here would misdescribe the
-    # risk. Rendered wherever the report is opened, not only in audit.log,
+    # risk. Rendered wherever the report is opened, not only in usage-report.log,
     # because a customer forwarding the report to a consultant needs to see
     # this without also having the run log in hand.
     $insecureBanner = if ($cfg.PSObject.Properties['IsHttp'] -and $cfg.IsHttp) {
@@ -4136,12 +6225,26 @@ function New-HtmlReport {
         [pscustomobject]@{
             Label = "$($_.Days) days"
             'Unique users' = $_.UniqueUsers
-            'Peak concurrent' = $_.Concurrency.Peak
+            'Peak concurrent sessions' = $_.Concurrency.Peak
         }
     })
 
     $logo = Get-BrandLogoSvg -Variant white
     $css = Get-BrandCss
+
+    # "Delivery groups: 0" and "Machines: 0" in a consolidated report state
+    # something false -- that the estate has none. The merge export carries
+    # identity and time only, so those counts are genuinely unknown here, and
+    # an unknown is not a zero. Measured on a real three-site consolidation,
+    # which printed both as 0 beside a 13-user headline.
+    $isConsolidated = $Analysis.PSObject.Properties['Consolidation'] -and $Analysis.Consolidation
+    $inventoryRows = if ($isConsolidated) {
+        '      <tr><td>Delivery groups</td><td>Not carried in merge exports</td></tr>' + "`n" +
+        '      <tr><td>Machines</td><td>Not carried in merge exports</td></tr>'
+    } else {
+        ('      <tr><td>Delivery groups</td><td>{0}</td></tr>' -f $Analysis.SiteTotals.DeliveryGroups) + "`n" +
+        ('      <tr><td>Machines</td><td>{0}</td></tr>' -f $Analysis.SiteTotals.Machines)
+    }
 
     @"
 <!DOCTYPE html>
@@ -4188,14 +6291,14 @@ $retentionBanner
       <tr><td>Environment</td><td>$(ConvertTo-HtmlEncoded -Text $cfg.EnvironmentLabel)</td></tr>
       <tr><td>Report generated</td><td>$(Format-LocalTime -Utc $Analysis.GeneratedUtc -TimeZoneId $tz)</td></tr>
       <tr><td>Session history retained</td><td>$retentionCell</td></tr>
-      <tr><td>Delivery groups</td><td>$($Analysis.SiteTotals.DeliveryGroups)</td></tr>
-      <tr><td>Machines</td><td>$($Analysis.SiteTotals.Machines)</td></tr>
+$inventoryRows
     </tbody>
   </table>
   </div>
 
   <h3>Headline, based on the $($widest.Days)-day window</h3>
   $(New-TruncationNotice -Window $widest)
+  $(New-PartialCoverageNotice -Window $widest)
   <div class="kpi-row">
     <div class="kpi">
       <div class="label">Unique users</div>
@@ -4203,26 +6306,37 @@ $retentionBanner
       <div class="note">Distinct users with at least one session</div>
     </div>
     <div class="kpi">
-      <div class="label">Peak concurrent</div>
+      <div class="label">Peak concurrent sessions</div>
       <div class="value">$($widest.Concurrency.Peak)</div>
       <div class="note">$(Format-LocalTime -Utc $widest.Concurrency.PeakAtUtc -TimeZoneId $tz)</div>
     </div>
   </div>
 
   <h3>Windows compared</h3>
-  $(New-SvgGroupedBarChart -Items $comparison -Series @('Unique users','Peak concurrent') -Width 1080 -Height 300 -Label 'Unique users and peak concurrency compared across windows')
+  $(New-SvgGroupedBarChart -Items $comparison -Series @('Unique users','Peak concurrent sessions') -Width 1080 -Height 300 -Label 'Unique users and peak concurrent sessions compared across windows')
 </div>
 
 $windowSections
+$(New-SiteIdentitySection -Identity $Analysis.SiteIdentity -TimeZoneId $tz)
+$(New-ConsolidationSection -Consolidation $consolidation)
 
 <div class="card">
   <h2>How to read this report</h2>
   <p><strong>Unique users</strong> counts distinct users with at least one
   session overlapping the window. A session that began before the window still
-  counts, because it still occupies a licence inside it.</p>
-  <p><strong>Peak concurrent</strong> is the exact maximum number of sessions
-  open simultaneously, with the moment it occurred.</p>
-  <p><strong>95th percentile concurrent</strong> is the level exceeded in only
+  counts, because it still occupies a license inside it.</p>
+  <p><strong>Every concurrency figure in this report counts SESSIONS, not
+  people.</strong> One person with a desktop and two published applications
+  open at once counts as three, because that is three simultaneous sessions.
+  The unique-user figures answer the separate question of how many distinct
+  people appeared at all.</p>
+  <p><strong>Peak concurrent sessions</strong> is the exact maximum number of
+  sessions open simultaneously, with the moment it occurred. It is computed
+  from session start and end times directly &mdash; no sampling, no rounding,
+  and no idle or disconnect timer of its own. A session that Citrix has not
+  yet logged off still counts as open, so this figure reflects the site's own
+  session timeout policy.</p>
+  <p><strong>95th percentile concurrent sessions</strong> is the level exceeded in only
   5% of the 15-minute samples taken across the whole window &mdash; nights,
   weekends and holidays included, not 5% of working time. A raw peak is
   frequently a single anomalous spike, so this percentile is a steadier
@@ -4231,11 +6345,11 @@ $windowSections
   matters is the working day rather than the average hour, read the
   business-hours column.</p>
   <p><strong>Anonymous sessions</strong> are reported separately because they do
-  not consume a named user licence.</p>
+  not consume a named user license.</p>
   <p><strong>Unattributed sessions</strong> are sessions with no user identity
   recorded that are not flagged anonymous &mdash; a de-provisioned account or a
   broker glitch, in practice. They likewise do not consume a named user
-  licence, and are reported separately from anonymous sessions so that every
+  license, and are reported separately from anonymous sessions so that every
   session in the window is accounted for: sessions belonging to an identified
   user, plus anonymous sessions, plus unattributed sessions, add up to the
   total sessions figure. <em>Unique users</em> is not a term in that sum
@@ -4252,7 +6366,8 @@ $windowSections
   when this particular site is actually used &mdash; it is not always one
   direction, so read whichever column matches what the contract needs to
   cover rather than assuming one is simply the other plus a margin.</p>
-  <p class="footnote">Generated by the Citrix Usage Report script. All times are
+  <p class="footnote">Generated by the Citrix Usage Report script, version
+  $(ConvertTo-HtmlEncoded -Text $script:ReportVersion) (built $(ConvertTo-HtmlEncoded -Text $script:ReportBuiltUtc)). All times are
   shown in $(ConvertTo-HtmlEncoded -Text $tz) unless stated otherwise;
   concurrency is computed in UTC and business hours are evaluated in that same
   displayed time zone.</p>
@@ -4285,7 +6400,7 @@ function Save-HtmlReport {
         Creates its output directory and writes the file with -ErrorAction
         Stop, then confirms the file actually exists before logging success.
         This does not rely solely on a caller having set
-        $ErrorActionPreference = 'Stop' (as Invoke-CitrixUsageAudit does):
+        $ErrorActionPreference = 'Stop' (as Invoke-CitrixUsageReport does):
         a function that reports "Report written" must have checked, so that
         an unwritable path -- a nonexistent drive, a read-only or
         access-denied location -- can never produce a confident success
@@ -4311,7 +6426,7 @@ function Save-HtmlReport {
         throw "Save-HtmlReport wrote no error but '$Path' does not exist afterwards; the report was not actually saved."
     }
 
-    Write-AuditLog -Level Success -Message "Report written to $Path"
+    Write-ReportLog -Level Success -Message "Report written to $Path"
     return $Path
 }
 
@@ -4323,10 +6438,10 @@ function Save-HtmlReport {
 # ============================================================================
 #  Export and anonymization
 #
-#  Anonymisation replaces identities with stable pseudonyms and never changes
+#  Anonymization replaces identities with stable pseudonyms and never changes
 #  a count. The mapping back to real identities is written to a separate file
 #  that stays with the customer, so a privacy-sensitive site can still take
-#  part in an audit without sending usernames anywhere.
+#  part in a usage report without sending usernames anywhere.
 # ============================================================================
 
 function New-AnonymizationMap {
@@ -4338,8 +6453,8 @@ function New-AnonymizationMap {
         alone. A session can reference a user id that the Users lookup does
         not carry (a de-provisioned account dropped from the lookup between
         fetches, for example) -- if the map were built from Users only, that
-        session's UserId would fall through anonymisation untouched and a
-        raw internal identifier would leak into an otherwise-anonymised
+        session's UserId would fall through anonymization untouched and a
+        raw internal identifier would leak into an otherwise-anonymized
         export. Blank/whitespace UserIds (unattributed sessions) are not
         assigned a pseudonym; there is no identity there to protect.
 
@@ -4374,7 +6489,7 @@ function New-IdentityMapRows {
     .SYNOPSIS
         The rows written to identity-map.csv: the customer's decode key.
     .DESCRIPTION
-        The anonymisation map is pseudonym -> Citrix's internal user id, and
+        The anonymization map is pseudonym -> Citrix's internal user id, and
         that id is an opaque surrogate key (a GUID-like integer on a real
         site). Writing only those two columns produced a "decode key" that
         decodes nothing a person can read, while the runbook promised it
@@ -4384,7 +6499,7 @@ function New-IdentityMapRows {
         This MUST be called while $Dataset still holds real identities -- that
         is, after New-AnonymizationMap and BEFORE ConvertTo-AnonymizedDataset,
         which is exactly the window the orchestrator uses. Called after
-        anonymisation it would faithfully write pseudonym -> pseudonym.
+        anonymization it would faithfully write pseudonym -> pseudonym.
 
         Ids present in the map but absent from Users (a de-provisioned account
         referenced only by a session -- see New-AnonymizationMap) still get a
@@ -4395,7 +6510,11 @@ function New-IdentityMapRows {
     [OutputType([object[]])]
     param(
         [Parameter(Mandatory)][hashtable] $Map,
-        [AllowNull()][AllowEmptyCollection()] $Users
+        [AllowNull()][AllowEmptyCollection()] $Users,
+        # The same salt the merge export is built with. Supplied only when
+        # this run produces one, because UserKey is meaningless -- and
+        # misleading, since it would not match any export -- without it.
+        [AllowNull()][byte[]] $Salt
     )
 
     $byId = @{}
@@ -4406,8 +6525,23 @@ function New-IdentityMapRows {
 
     $rows = foreach ($id in @($Map.Keys | Sort-Object)) {
         $u = $byId[[string] $id]
+
+        # The join key between this file and merge-export.json, and the only
+        # way a customer can check a CONSOLIDATED user count for themselves.
+        # The export identifies people by this key and carries no names; this
+        # file carries the names and never leaves the machine. Putting the key
+        # beside the name here discloses nothing further -- the real identity
+        # is already in the row -- and turns two unrelatable files into a
+        # local join.
+        $userKey = ''
+        if ($Salt -and $u) {
+            $k = Get-UserIdentityKey -Sid ([string] $u.Sid) -Salt $Salt
+            if ($k) { $userKey = $k }
+        }
+
         [pscustomobject]@{
             Pseudonym  = $Map[$id]
+            UserKey    = $userKey
             RealUserId = $id
             UserName   = $(if ($u) { [string] $u.UserName } else { '' })
             FullName   = $(if ($u) { [string] $u.FullName } else { '' })
@@ -4434,7 +6568,7 @@ function ConvertTo-AnonymizedDataset {
         Get-UniqueUserStats and every other session-derived breakdown reads
         UserId straight off Sessions, so leaving Sessions alone would let a
         raw user id resurface anywhere built from session data, defeating
-        the anonymisation this function exists to provide.
+        the anonymization this function exists to provide.
 
         This does not change any count. The map built by
         New-AnonymizationMap is a bijection -- no two users share a
@@ -4503,7 +6637,7 @@ function ConvertTo-AnonymizedDataset {
         # subexpression: that shape re-enumerates its output and unwraps a
         # single-element array to a scalar even with @() already inside the
         # if -- see the array-convention note in src/60-Analytics.ps1's
-        # Invoke-AuditAnalysis. These values are always scalars (a string
+        # Invoke-ReportAnalysis. These values are always scalars (a string
         # or $null), not arrays, so the collapse this file's callers must
         # guard against elsewhere cannot bite here -- but the plain-variable
         # shape is used anyway, for consistency with the one true pattern.
@@ -4542,7 +6676,7 @@ function ConvertTo-AnonymizedDataset {
     return $copy
 }
 
-function ConvertTo-AuditRoundTripUtcText {
+function ConvertTo-ReportRoundTripUtcText {
     <#
     .SYNOPSIS
         Formats a UTC datetime unambiguously for a customer-facing CSV.
@@ -4576,7 +6710,7 @@ function ConvertTo-AuditRoundTripUtcText {
     return $Value.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
-function Export-AuditData {
+function Export-ReportData {
     <#
     .SYNOPSIS
         Writes the analysis and raw session data to JSON and CSV for
@@ -4586,15 +6720,15 @@ function Export-AuditData {
         object -- Analysis.Config carries the credential objects the run was
         authenticated with (ClientSecret, Credential), and those must never
         persist to disk. $exportable is built field by field rather than
-        serialising $Analysis wholesale so a future field added to Config
+        serializing $Analysis wholesale so a future field added to Config
         cannot silently leak into an exported file.
 
         sessions.csv is the raw, per-session data the dataset carries --
         distinct from every other file this function writes, which is
         derived/aggregated analysis. Its purpose is letting the customer
-        re-analyse on their own side or spot-check the aggregate numbers.
+        re-analyze on their own side or spot-check the aggregate numbers.
         When -Dataset was produced by ConvertTo-AnonymizedDataset, its
-        UserId column is already pseudonymous, because anonymisation is
+        UserId column is already pseudonymous, because anonymization is
         fixed at the dataset level (Sessions.UserId), not patched on at
         export time.
     .OUTPUTS
@@ -4616,7 +6750,7 @@ function Export-AuditData {
         [Parameter(Mandatory)][string] $OutputPath,
         [hashtable] $Map,
 
-        # Built by New-IdentityMapRows BEFORE the dataset was anonymised, so
+        # Built by New-IdentityMapRows BEFORE the dataset was anonymized, so
         # it still carries real usernames. $Dataset by this point holds
         # pseudonyms, so the rows cannot be derived here.
         [AllowNull()][AllowEmptyCollection()] $MapRows
@@ -4633,7 +6767,7 @@ function Export-AuditData {
     # Plain local with @() applied directly, never a `$(if ...)` inside the
     # hashtable literal below -- see the array-convention note in
     # src/60-Analytics.ps1. A single fetch warning is the likeliest case, and
-    # a collapsed one would serialise to a bare object instead of a
+    # a collapsed one would serialize to a bare object instead of a
     # one-element array in data.json.
     $fetchWarnings = @()
     if ($Analysis.PSObject.Properties['FetchWarnings']) { $fetchWarnings = @($Analysis.FetchWarnings) }
@@ -4644,6 +6778,10 @@ function Export-AuditData {
         Environment  = $Analysis.Config.EnvironmentLabel
         IsDemo       = $Analysis.IsDemo
         Preflight    = $Analysis.Preflight
+        # Present so a consolidated view built from several exports can tell
+        # which site each one came from, and can recognize the same site
+        # submitted twice. Contains no user data.
+        SiteIdentity = $Analysis.SiteIdentity
         # Incomplete/unbounded fetches, so a re-analysis in the customer's own
         # tooling can see that a figure is a lower bound rather than a count.
         FetchWarnings = $fetchWarnings
@@ -4669,7 +6807,7 @@ function Export-AuditData {
                     P95 = $_.Concurrency.P95; P99 = $_.Concurrency.P99
                     BusinessP95 = $_.Concurrency.BusinessP95; BusinessPeak = $_.Concurrency.BusinessPeak
                     # What "business hours" meant for this run. Without it a
-                    # reader re-analysing data.json cannot tell whether a
+                    # reader re-analyzing data.json cannot tell whether a
                     # BusinessP95 was measured over a London working day or a
                     # Sydney one, and the two are not comparable.
                     BusinessHourStart = $_.Concurrency.BusinessHourStart
@@ -4685,7 +6823,7 @@ function Export-AuditData {
         })
     }
 
-    # Resolved to an absolute path first: WriteAllText below does not honour
+    # Resolved to an absolute path first: WriteAllText below does not honor
     # PowerShell's current location the way Set-Content does, and the
     # directory has already been created above if it did not exist.
     $jsonDir = (Resolve-Path -LiteralPath $OutputPath).Path
@@ -4697,7 +6835,7 @@ function Export-AuditData {
     # which standard JSON tooling outside PowerShell (Python's json module,
     # most JavaScript parsers) rejects outright with an error that gives no
     # hint about the cause -- and data.json exists specifically so an
-    # operator can re-analyse a customer's numbers in their own tooling.
+    # operator can re-analyze a customer's numbers in their own tooling.
     # Deliberately NOT applied to the CSVs below: Excel uses the BOM to
     # detect UTF-8, and those files are meant to be opened by a person, not
     # parsed by a standards-conforming machine reader. Same encoding
@@ -4705,7 +6843,7 @@ function Export-AuditData {
     [System.IO.File]::WriteAllText($jsonPath, $json, (New-Object System.Text.UTF8Encoding($false)))
     [void] $written.Add($jsonPath)
 
-    # Skipped when there are no windows to summarise, rather than writing an
+    # Skipped when there are no windows to summarize, rather than writing an
     # empty, header-less CSV: Export-Csv still creates a zero-byte file for
     # zero pipeline input, and a file with nothing usable in it is worse than
     # no file at all.
@@ -4741,7 +6879,7 @@ function Export-AuditData {
     # derived/aggregated analysis. Skipped (like summary.csv above) when
     # there is nothing to write, rather than emitting a useless empty file.
     # Timestamps are written in an explicit invariant round-trip UTC form
-    # (see ConvertTo-AuditRoundTripUtcText), not the machine's locale
+    # (see ConvertTo-ReportRoundTripUtcText), not the machine's locale
     # format, so a customer in another locale gets back a file they can
     # actually parse.
     if ($sessions.Count -gt 0) {
@@ -4751,8 +6889,8 @@ function Export-AuditData {
                 SessionKey  = $s.SessionKey
                 UserId      = $s.UserId
                 MachineId   = $s.MachineId
-                StartUtc    = ConvertTo-AuditRoundTripUtcText -Value $s.StartUtc
-                EndUtc      = ConvertTo-AuditRoundTripUtcText -Value $s.EndUtc
+                StartUtc    = ConvertTo-ReportRoundTripUtcText -Value $s.StartUtc
+                EndUtc      = ConvertTo-ReportRoundTripUtcText -Value $s.EndUtc
                 SessionType = $s.SessionType
                 IsAnonymous = $s.IsAnonymous
             }
@@ -4767,17 +6905,17 @@ function Export-AuditData {
         $mapPath = Join-Path $OutputPath 'identity-map.csv'
         $rows = @($MapRows)
         if ($rows.Count -eq 0) {
-            # No pre-anonymisation snapshot was supplied, so only the internal
+            # No pre-anonymization snapshot was supplied, so only the internal
             # ids can be written. The name columns are still emitted, blank,
             # so the file's shape does not silently change between callers.
             $rows = @(New-IdentityMapRows -Map $Map -Users @())
         }
         $rows | Export-Csv -Path $mapPath -NoTypeInformation -Encoding UTF8
         [void] $written.Add($mapPath)
-        Write-AuditLog -Level Warn -Message "Identity map written to $mapPath. Keep this file. Do not send it with the report."
+        Write-ReportLog -Level Warn -Message "Identity map written to $mapPath. Keep this file. Do not send it with the report."
     }
 
-    Write-AuditLog -Level Success -Message "Exported $($written.Count) data file(s) to $OutputPath"
+    Write-ReportLog -Level Success -Message "Exported $($written.Count) data file(s) to $OutputPath"
 
     # Plain array return, NOT `return ,$written.ToArray()`. This codebase's
     # convention (see src/60-Analytics.ps1) is: collection-returning functions
@@ -4791,6 +6929,1028 @@ function Export-AuditData {
 }
 
 # endregion 80-Export.ps1
+
+# ----------------------------------------------------------------------------
+# region 85-MergeExport.ps1
+# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# The merge export
+#
+# One site's contribution to a consolidated report, written so that it can be
+# combined with other sites' exports and with this site's own exports from
+# months ago.
+#
+# Deliberately NARROWER than data.json. Consolidation needs identity and time
+# and nothing else, so machine names, client device names, client addresses,
+# Workspace app versions, application names and delivery group names are
+# absent by construction rather than by anonymization. This is the file that
+# travels between sites and is kept for years; it should carry the least that
+# still answers the question.
+# ---------------------------------------------------------------------------
+
+# Bumped when the shape changes in a way a reader must understand. A merge
+# refuses a schema it does not know rather than guessing.
+$script:MergeSchemaVersion = 1
+
+function ConvertTo-MergeUtcText {
+    <#
+    .SYNOPSIS
+        A UTC instant as ISO-8601 for JSON, preserving null as null.
+    .DESCRIPTION
+        Not ConvertTo-ReportRoundTripUtcText: that one maps $null to an empty
+        string, which is the right choice for a CSV column and the wrong one
+        here. In JSON an empty string is not a null date -- a reader parsing
+        "" gets DateTime.MinValue, so a session that is still running would
+        come back as one that ended in the year 1. A null end date has to stay
+        null all the way to the file.
+    .OUTPUTS
+        [string], or $null.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()] $Utc)
+
+    if ($null -eq $Utc) { return $null }
+    return ([datetime]$Utc).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ',
+        [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Export-MergeData {
+    <#
+    .SYNOPSIS
+        Writes this site's contribution to a consolidated report.
+    .DESCRIPTION
+        Sessions carry the cross-site user key in place of Sessions.UserId,
+        which is a row number in this site's own database and would join
+        unrelated people if it left the site.
+
+        Well-known SIDs never become a user key. Their sessions are still
+        exported, with no key, so session totals continue to add up.
+    .OUTPUTS
+        [string] -- the path written.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][pscustomobject] $Dataset,
+        [Parameter(Mandatory)][pscustomobject] $Config,
+        [Parameter(Mandatory)][string] $Path,
+        [AllowNull()][byte[]] $Salt,
+        [AllowNull()][string] $SaltFingerprint
+    )
+
+    $anonymized = [bool]($Salt -and $Salt.Length -gt 0)
+
+    # Which UPNs cannot be trusted to mean one person in this site. Computed
+    # once, from the whole user set, because ambiguity is a property of the
+    # set rather than of any one row.
+    $ambiguous = @(Get-AmbiguousUpn -Users $Dataset.Users)
+    $ambiguousSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($a in $ambiguous) { [void] $ambiguousSet.Add($a) }
+
+    # Site-local Users.Id -> cross-site user key. The only place the local id
+    # is used, and it never reaches the file.
+    $keyByLocalId = @{}
+    $users = New-Object System.Collections.Generic.List[object]
+
+    foreach ($u in @($Dataset.Users)) {
+        if (-not $u) { continue }
+
+        $userKey = Get-UserIdentityKey -Sid ([string]$u.Sid) -Salt $Salt
+        if (-not $userKey) { continue }   # well-known or absent SID
+
+        $keyByLocalId[[string]$u.Id] = $userKey
+
+        $upnRaw = [string]$u.Upn
+        $upnNormalized = if ([string]::IsNullOrWhiteSpace($upnRaw)) { $null } else { $upnRaw.Trim().ToLowerInvariant() }
+        $isAmbiguous = [bool]($upnNormalized -and $ambiguousSet.Contains($upnNormalized))
+
+        # A bridge key is emitted only for a UPN that means one person here.
+        $bridgeKey = $null
+        if (-not $isAmbiguous) {
+            $bridgeKey = Get-UpnBridgeKey -Upn $upnRaw -Salt $Salt
+        }
+
+        $users.Add([pscustomobject][ordered]@{
+            userKey            = $userKey
+            # Present so a consolidated report can say how many directories a
+            # UPN bridge spans. A bridge widening past two forests is what a
+            # genuine UPN collision looks like, and the user key is opaque
+            # under anonymization so the forest cannot be recovered from it.
+            forestKey          = Get-ForestKey -Sid ([string]$u.Sid) -Salt $Salt
+            bridgeKey          = $bridgeKey
+            upnAmbiguousInSite = $isAmbiguous
+        })
+    }
+
+    $sessions = New-Object System.Collections.Generic.List[object]
+    foreach ($s in @($Dataset.Sessions)) {
+        if (-not $s) { continue }
+
+        $localId = [string]$s.UserId
+        $userKey = $null
+        if ($localId -and $keyByLocalId.ContainsKey($localId)) { $userKey = $keyByLocalId[$localId] }
+
+        $sessions.Add([pscustomobject][ordered]@{
+            sessionKey  = [string]$s.SessionKey
+            userKey     = $userKey
+            startUtc    = ConvertTo-MergeUtcText -Utc $s.StartUtc
+            endUtc      = ConvertTo-MergeUtcText -Utc $s.EndUtc
+            isAnonymous = [bool]$s.IsAnonymous
+        })
+    }
+
+    $site = $Dataset.SiteIdentity
+    $payload = [ordered]@{
+        schemaVersion     = $script:MergeSchemaVersion
+        toolVersion       = $script:ReportVersion
+        exportedUtc       = ConvertTo-MergeUtcText -Utc ([datetime]::UtcNow)
+        windowStartUtc    = ConvertTo-MergeUtcText -Utc $Config.WidestWindowStartUtc
+        windowEndUtc      = ConvertTo-MergeUtcText -Utc $Config.WindowEndUtc
+        # The window above is the one that was REQUESTED. This is the instant
+        # from which history actually existed on this site, and without it a
+        # consolidation cannot tell the two apart: three exports all asking
+        # for 90 days look like three sites covering 90 days, even when one of
+        # them retained 10. Measured exactly that way -- a consolidated report
+        # claimed full 90-day coverage while one contributor had 10 days and
+        # had all three of its own windows marked truncated.
+        #
+        # Null when unknown, and a consolidation treats null as UNCONFIRMED
+        # rather than as full coverage. Added without a schema bump because it
+        # is additive: older readers ignore it, and newer readers handle its
+        # absence, which is what every export written before now looks like.
+        historyStartUtc   = $(
+            $hs = $null
+            if ($Dataset.PSObject.Properties['Preflight'] -and $Dataset.Preflight) {
+                if ($Dataset.Preflight.PSObject.Properties['HistoryStartUtc'] -and
+                    $Dataset.Preflight.HistoryStartUtc) {
+                    $hs = $Dataset.Preflight.HistoryStartUtc
+                } elseif ($Dataset.Preflight.PSObject.Properties['OldestSessionUtc'] -and
+                          $Dataset.Preflight.OldestSessionUtc) {
+                    $hs = $Dataset.Preflight.OldestSessionUtc
+                }
+            }
+            ConvertTo-MergeUtcText -Utc $hs
+        )
+        anonymized        = $anonymized
+        saltFingerprint   = $(if ($anonymized) { $SaltFingerprint } else { $null })
+        ambiguousUpnCount = $ambiguous.Count
+        site              = [ordered]@{
+            environmentLabel  = $(if ($site) { $site.EnvironmentLabel } else { $Config.EnvironmentLabel })
+            isCloud           = $(if ($site) { [bool]$site.IsCloud } else { [bool]$Config.IsCloud })
+            customerId        = $(if ($site) { $site.CustomerId } else { $null })
+            registrationHosts = $(if ($site) { @($site.ControllerFqdns) } else { @() })
+            deliveryGroupIds  = $(if ($site) { @($site.DeliveryGroupIds) } else { @() })
+            catalogIds        = $(if ($site) { @($site.CatalogIds) } else { @() })
+            zones             = $(if ($site) { @($site.Zones) } else { @() })
+            productVersion    = $(if ($site) { $site.ProductVersion } else { $null })
+            clockSkewSeconds  = $(if ($site) { $site.ClockSkewSeconds } else { $null })
+        }
+        # .ToArray() rather than @($users): in Windows PowerShell 5.1,
+        # ConvertTo-Json cannot serialize the result of wrapping a
+        # System.Collections.Generic.List in @() and fails with "Argument
+        # types do not match". The List itself serializes, and so does
+        # .ToArray(); only the @() form is broken. [object[]] is explicit so a
+        # single-element result still renders as a JSON array rather than
+        # collapsing to a bare object.
+        users    = [object[]] $users.ToArray()
+        sessions = [object[]] $sessions.ToArray()
+    }
+
+    $json = $payload | ConvertTo-Json -Depth 8
+
+    # No BOM: RFC 8259 forbids it and Python and JavaScript parsers reject it.
+    # The same defect was found and fixed once already in data.json, so it is
+    # written through the byte API rather than Set-Content.
+    $dir = Split-Path -Parent $Path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+    }
+    [IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+
+    Write-ReportLog -Level Success -Message "Merge export written to $Path ($($users.Count) user(s), $($sessions.Count) session(s))."
+    if ($ambiguous.Count -gt 0) {
+        Write-ReportLog -Level Warn -Message "$($ambiguous.Count) UPN(s) in this site map to more than one account and are excluded from cross-forest matching. Those users can still be matched by SID."
+    }
+
+    return $Path
+}
+
+# endregion 85-MergeExport.ps1
+
+# ----------------------------------------------------------------------------
+# region 86-MergeImport.ps1
+# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Reading a set of merge exports
+#
+# The consolidated figure is only as trustworthy as its inputs, and the ways a
+# set of exports can be wrong are mostly SILENT. Two exports made under
+# different salts show every person twice; one anonymized and one not can
+# never match at all. Both produce a plausible report with an inflated count
+# and nothing in it that looks out of place.
+#
+# So validation refuses those combinations rather than warning about them, and
+# it reports what it refused and why.
+# ---------------------------------------------------------------------------
+
+# The schema versions this code understands. A file from a future version may
+# mean something different by the same field names, so an unknown version is
+# refused rather than read hopefully.
+$script:SupportedMergeSchemas = @(1)
+
+function Import-MergeExport {
+    <#
+    .SYNOPSIS
+        Reads one merge export, reporting rather than throwing on a bad file.
+    .DESCRIPTION
+        A consolidation run is given several paths, one of which may be a typo
+        or the wrong file entirely. One bad path must not cost the others, so
+        every failure is returned as data rather than raised.
+    .OUTPUTS
+        One object with Path, Export and Error. Error is $null when usable.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string] $Path)
+
+    $result = [pscustomobject]@{ Path = $Path; Export = $null; Error = $null }
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        $result.Error = "File not found: $Path"
+        return $result
+    }
+
+    try {
+        $json = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    } catch {
+        $result.Error = "Could not read $Path as JSON: $($_.Exception.Message)"
+        return $result
+    }
+
+    if (-not $json -or -not $json.PSObject.Properties['schemaVersion']) {
+        $result.Error = "$Path is not a merge export: it has no schemaVersion. The file to supply is merge-export.json, not data.json."
+        return $result
+    }
+
+    $schema = [int] $json.schemaVersion
+    if ($script:SupportedMergeSchemas -notcontains $schema) {
+        $result.Error = "$Path uses merge schema $schema, which this version does not understand (it understands $($script:SupportedMergeSchemas -join ', ')). Use a newer build to read it."
+        return $result
+    }
+
+    foreach ($required in 'users', 'sessions', 'site', 'windowStartUtc', 'windowEndUtc') {
+        if (-not $json.PSObject.Properties[$required]) {
+            $result.Error = "$Path is missing the '$required' field and cannot be consolidated."
+            return $result
+        }
+    }
+
+    $result.Export = $json
+    return $result
+}
+
+function Test-MergeExportSet {
+    <#
+    .SYNOPSIS
+        Decides which of a set of exports can be consolidated together.
+    .DESCRIPTION
+        Rejects the ENTIRE set for the two faults that would produce a wrong
+        number silently -- disagreeing salts, and mixing anonymized with
+        unanonymized -- because in both cases no subset is more trustworthy
+        than another. Individual unreadable files are dropped and named.
+
+        A repeated site is NOT a fault. The same site exported on two dates is
+        the temporal workflow this whole design exists to support, and session
+        keys are GUIDs so the overlapping window deduplicates itself. It is
+        counted and reported, never refused.
+    .OUTPUTS
+        One object. Usable, Rejected and CoverageGaps are always arrays.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyCollection()] $Imports)
+
+    $usable = New-Object System.Collections.Generic.List[object]
+    $rejected = New-Object System.Collections.Generic.List[object]
+
+    foreach ($i in @($Imports)) {
+        if (-not $i) { continue }
+        if ($i.Error) {
+            $rejected.Add([pscustomobject]@{ Path = $i.Path; Reason = $i.Error })
+        } else {
+            $usable.Add($i)
+        }
+    }
+
+    # --- the two set-wide faults -------------------------------------------
+    if ($usable.Count -gt 1) {
+        $anonFlags = @($usable | ForEach-Object { [bool]$_.Export.anonymized } | Sort-Object -Unique)
+        if ($anonFlags.Count -gt 1) {
+            foreach ($u in $usable) {
+                $rejected.Add([pscustomobject]@{ Path = $u.Path
+                    Reason = 'This set mixes anonymized and unanonymized exports. One carries derived keys and the other raw identifiers, so they can never match: a person present in both would be counted twice and the consolidated total inflated, with nothing in the report looking wrong. Re-export so that all inputs are anonymized, or none are.' })
+            }
+            $usable.Clear()
+        }
+    }
+
+    if ($usable.Count -gt 1) {
+        $prints = @($usable | Where-Object { [bool]$_.Export.anonymized } |
+            ForEach-Object { [string]$_.Export.saltFingerprint } | Sort-Object -Unique)
+        if ($prints.Count -gt 1) {
+            foreach ($u in $usable) {
+                $rejected.Add([pscustomobject]@{ Path = $u.Path
+                    Reason = 'These exports were made under different anonymization salts. The same person resolves to a different key in each, so every shared person would be counted twice and the consolidated total inflated silently. Use one salt file for every export intended for one report.' })
+            }
+            $usable.Clear()
+        }
+    }
+
+    # --- repeated sites, counted rather than refused ------------------------
+    # Delivery group identifiers are GUIDs minted by the site itself, so two
+    # exports sharing any of them came from one site. That is the temporal
+    # workflow, not a mistake.
+    $siteGroups = New-Object System.Collections.Generic.List[object]
+    foreach ($u in $usable) {
+        $ids = @($u.Export.site.deliveryGroupIds)
+        $matched = $false
+        foreach ($g in $siteGroups) {
+            foreach ($id in $ids) {
+                if ($g.Ids -contains $id) { $g.Count++; $matched = $true; break }
+            }
+            if ($matched) { break }
+        }
+        if (-not $matched) { $siteGroups.Add([pscustomobject]@{ Ids = $ids; Count = 1 }) }
+    }
+    $repeated = @($siteGroups | Where-Object { $_.Count -gt 1 }).Count
+
+    # --- coverage gaps ------------------------------------------------------
+    # Two 90-day exports taken 120 days apart leave 30 days nothing covers, and
+    # a total spanning that gap is a lower bound rather than a count.
+    $gaps = New-Object System.Collections.Generic.List[object]
+    $windows = @($usable | ForEach-Object {
+        [pscustomobject]@{
+            Start = ([datetime]::Parse([string]$_.Export.windowStartUtc)).ToUniversalTime()
+            End   = ([datetime]::Parse([string]$_.Export.windowEndUtc)).ToUniversalTime()
+        }
+    } | Sort-Object Start)
+
+    if ($windows.Count -gt 1) {
+        $reach = $windows[0].End
+        foreach ($w in $windows[1..($windows.Count - 1)]) {
+            if ($w.Start -gt $reach) {
+                $gaps.Add([pscustomobject]@{ FromUtc = $reach; ToUtc = $w.Start })
+            }
+            if ($w.End -gt $reach) { $reach = $w.End }
+        }
+    }
+
+    $anonymized = $false
+    if ($usable.Count -gt 0) { $anonymized = [bool]$usable[0].Export.anonymized }
+
+    [pscustomobject]@{
+        Usable        = [object[]] $usable.ToArray()
+        Rejected      = [object[]] $rejected.ToArray()
+        Anonymized    = $anonymized
+        CoverageGaps  = [object[]] $gaps.ToArray()
+        SitesSeen     = $siteGroups.Count
+        RepeatedSites = $repeated
+    }
+}
+
+# endregion 86-MergeImport.ps1
+
+# ----------------------------------------------------------------------------
+# region 87-Consolidate.ps1
+# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Consolidating several exports into one dataset
+#
+# Identity resolution happens at two levels of confidence, and the report
+# shows both figures rather than only the final one.
+#
+# Matching on the user key is exact. Two exports carrying the same key
+# describe the same directory principal -- proven live across an on-premises
+# site and a Citrix Cloud Government site, where the same account reported the
+# same security identifier while the site-local Users.Id differed (2 and 16).
+#
+# Bridging on a user principal name is a CLAIM, not a measurement. A live
+# three-site run showed the two situations it cannot distinguish: one person
+# holding accounts in two forests under one name, and two different people who
+# share a name. Both show that name mapping to exactly one identifier per
+# site. So bridging is off by default, every bridge is enumerated, and a
+# bridge that widens past two forests is flagged for a human to check.
+# ---------------------------------------------------------------------------
+
+function Get-ConsolidationRoot {
+    <#
+    .SYNOPSIS
+        Follows a union-find parent chain to its representative.
+    .DESCRIPTION
+        Internal. Kept as a function rather than inlined so the identity
+        resolver reads as the argument it is making rather than as pointer
+        chasing.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)][string] $Key,
+        [Parameter(Mandatory)][hashtable] $Parent
+    )
+
+    $k = $Key
+    while ($Parent[$k] -ne $k) { $k = $Parent[$k] }
+    return $k
+}
+
+function Resolve-ConsolidatedIdentity {
+    <#
+    .SYNOPSIS
+        Maps every export's user keys onto one consolidated identity per person.
+    .OUTPUTS
+        One object. KeyMap is a hashtable; Bridges is always an array.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()] $Imports,
+        [switch] $UseUpnBridge,
+        [AllowNull()][string[]] $ExcludeBridgeKey
+    )
+
+    $excluded = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($e in @($ExcludeBridgeKey)) {
+        if (-not [string]::IsNullOrWhiteSpace($e)) { [void] $excluded.Add($e.Trim().ToLowerInvariant()) }
+    }
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($i in @($Imports)) {
+        if (-not $i -or $i.Error) { continue }
+        foreach ($u in @($i.Export.users)) {
+            if (-not $u -or [string]::IsNullOrWhiteSpace([string]$u.userKey)) { continue }
+            $rows.Add($u)
+        }
+    }
+
+    $naive = $rows.Count
+    # Sorted, so the representative chosen for a group is the lexicographically
+    # smallest member and the result does not depend on input order.
+    $distinctKeys = @($rows | ForEach-Object { [string]$_.userKey } | Sort-Object -Unique)
+    $sidOnly = $distinctKeys.Count
+
+    $parent = @{}
+    foreach ($k in $distinctKeys) { $parent[$k] = $k }
+
+    $bridges = New-Object System.Collections.Generic.List[object]
+    $excludedCount = 0
+
+    if ($UseUpnBridge) {
+        # A bridge key is usable only where NO export called it ambiguous.
+        # Measured twice, in two unrelated tenants: a name mapping to two
+        # identifiers inside one site means that name does not identify a
+        # person in this estate, wherever else it appears.
+        $poisoned = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($u in $rows) {
+            if ([bool]$u.upnAmbiguousInSite -and -not [string]::IsNullOrWhiteSpace([string]$u.bridgeKey)) {
+                [void] $poisoned.Add(([string]$u.bridgeKey).Trim().ToLowerInvariant())
+            }
+        }
+
+        $byBridge = @{}
+        foreach ($u in $rows) {
+            $bk = [string]$u.bridgeKey
+            if ([string]::IsNullOrWhiteSpace($bk)) { continue }
+            $bk = $bk.Trim().ToLowerInvariant()
+            if ($poisoned.Contains($bk)) { continue }
+            if ($excluded.Contains($bk)) { continue }
+
+            if (-not $byBridge.ContainsKey($bk)) {
+                $byBridge[$bk] = [pscustomobject]@{
+                    UserKeys   = New-Object 'System.Collections.Generic.HashSet[string]'
+                    ForestKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+                }
+            }
+            [void] $byBridge[$bk].UserKeys.Add([string]$u.userKey)
+            if (-not [string]::IsNullOrWhiteSpace([string]$u.forestKey)) {
+                [void] $byBridge[$bk].ForestKeys.Add([string]$u.forestKey)
+            }
+        }
+
+        foreach ($bk in @($byBridge.Keys | Sort-Object)) {
+            $keys = @(@($byBridge[$bk].UserKeys) | Sort-Object)
+            if ($keys.Count -lt 2) { continue }   # nothing to join
+
+            $forests = @(@($byBridge[$bk].ForestKeys) | Sort-Object)
+
+            # One person with three forest accounts is possible; it is also
+            # what a genuine name collision looks like as it widens. Flagged
+            # and STILL JOINED -- withholding it silently would be the same
+            # kind of unexplained decision this whole section exists to avoid.
+            $suspect = ($keys.Count -gt 2 -or $forests.Count -gt 2)
+
+            $root = Get-ConsolidationRoot -Key $keys[0] -Parent $parent
+            foreach ($k in $keys) {
+                $r = Get-ConsolidationRoot -Key $k -Parent $parent
+                if ($r -ne $root) { $parent[$r] = $root }
+            }
+
+            $bridges.Add([pscustomobject]@{
+                BridgeKey  = $bk
+                UserKeys   = [object[]] $keys
+                ForestKeys = [object[]] $forests
+                IsSuspect  = $suspect
+            })
+        }
+
+        foreach ($e in $excluded) {
+            $hit = @($rows | Where-Object {
+                -not [string]::IsNullOrWhiteSpace([string]$_.bridgeKey) -and
+                ([string]$_.bridgeKey).Trim().ToLowerInvariant() -eq $e })
+            if ($hit.Count -gt 0) { $excludedCount++ }
+        }
+    }
+
+    $keyMap = @{}
+    foreach ($k in $distinctKeys) { $keyMap[$k] = Get-ConsolidationRoot -Key $k -Parent $parent }
+
+    [pscustomobject]@{
+        KeyMap            = $keyMap
+        NaiveCount        = $naive
+        SidOnlyCount      = $sidOnly
+        ConsolidatedCount = @($keyMap.Values | Sort-Object -Unique).Count
+        Bridges           = [object[]] $bridges.ToArray()
+        ExcludedUpnCount  = $excludedCount
+    }
+}
+
+function Merge-ConsolidatedSessions {
+    <#
+    .SYNOPSIS
+        One session stream from many exports, deduplicated and re-keyed.
+    .DESCRIPTION
+        Deduplicated on the session key, which is a GUID. Measured across
+        three live sites: 194 keys, zero collisions. That is what lets two
+        exports whose windows overlap be unioned without counting a session
+        twice, and it is why the temporal workflow needs no extra bookkeeping.
+
+        The user key is rewritten through the consolidated map, so two bridged
+        forest accounts reach the analytics as one person. Without that, the
+        unique-user count would quietly undo the merge.
+    .OUTPUTS
+        A plain array of session objects. Callers wrap in @().
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()] $Imports,
+        [Parameter(Mandatory)][hashtable] $KeyMap
+    )
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $out = New-Object System.Collections.Generic.List[object]
+
+    foreach ($i in @($Imports)) {
+        if (-not $i -or $i.Error) { continue }
+        foreach ($s in @($i.Export.sessions)) {
+            if (-not $s) { continue }
+            $key = [string]$s.sessionKey
+            if ([string]::IsNullOrWhiteSpace($key)) { continue }
+            if (-not $seen.Add($key)) { continue }
+
+            $userKey = [string]$s.userKey
+            $mapped = $null
+            if (-not [string]::IsNullOrWhiteSpace($userKey)) {
+                $mapped = $(if ($KeyMap.ContainsKey($userKey)) { $KeyMap[$userKey] } else { $userKey })
+            }
+
+            # Parsed to real DateTimes: the analytics does arithmetic on
+            # these, and a string would compare lexicographically instead,
+            # making every interval wrong while looking plausible.
+            $start = $null
+            if (-not [string]::IsNullOrWhiteSpace([string]$s.startUtc)) {
+                $start = [datetime]::SpecifyKind(
+                    ([datetime]::Parse([string]$s.startUtc)).ToUniversalTime(),
+                    [System.DateTimeKind]::Utc)
+            }
+            $end = $null
+            if (-not [string]::IsNullOrWhiteSpace([string]$s.endUtc)) {
+                $end = [datetime]::SpecifyKind(
+                    ([datetime]::Parse([string]$s.endUtc)).ToUniversalTime(),
+                    [System.DateTimeKind]::Utc)
+            }
+
+            $out.Add([pscustomobject]@{
+                SessionKey  = $key
+                UserId      = $mapped
+                StartUtc    = $start
+                EndUtc      = $end
+                IsAnonymous = [bool]$s.isAnonymous
+                MachineId   = $null
+            })
+        }
+    }
+
+    return $out.ToArray()
+}
+
+function Get-ConsolidatedSiteCoverage {
+    <#
+    .SYNOPSIS
+        What each SITE covers, unioned across all of its exports.
+    .DESCRIPTION
+        Coverage has to be judged per site, not per export, because the whole
+        point of the temporal workflow is that one site contributes many
+        exports. Six monthly exports of one site cover six months between
+        them; asked one at a time, every one of them "fails" to cover a
+        180-day window, and reporting that told an operator their total was a
+        lower bound when it was complete.
+
+        Intervals are merged, so overlapping monthly windows -- which is what
+        re-running on a schedule produces -- join into one span. A genuine
+        hole (a month nobody exported) does NOT join, and the site's
+        contiguous coverage correctly stops at the near side of the hole.
+    .OUTPUTS
+        One object per site. Always an array.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([Parameter(Mandatory)][AllowEmptyCollection()] $Coverage)
+
+    $groups = New-Object System.Collections.Generic.List[object]
+
+    foreach ($c in @($Coverage)) {
+        $ids = @($c.DeliveryGroupIds)
+        $match = $null
+        foreach ($g in $groups) {
+            foreach ($id in $ids) {
+                if ($g.Ids -contains $id) { $match = $g; break }
+            }
+            if ($match) { break }
+        }
+        if (-not $match) {
+            $match = [pscustomobject]@{
+                Ids     = New-Object System.Collections.Generic.List[string]
+                Label   = [string] $c.EnvironmentLabel
+                Members = New-Object System.Collections.Generic.List[object]
+            }
+            $groups.Add($match)
+        }
+        foreach ($id in $ids) { if ($match.Ids -notcontains $id) { $match.Ids.Add([string]$id) } }
+        $match.Members.Add($c)
+    }
+
+    $results = foreach ($g in $groups) {
+        $intervals = @($g.Members | Sort-Object CoverageStartUtc |
+            ForEach-Object { [pscustomobject]@{ Start = $_.CoverageStartUtc; End = $_.CoverageEndUtc } })
+
+        # Merge overlapping or touching intervals.
+        $merged = New-Object System.Collections.Generic.List[object]
+        foreach ($i in $intervals) {
+            if ($merged.Count -eq 0) {
+                $merged.Add([pscustomobject]@{ Start = $i.Start; End = $i.End })
+                continue
+            }
+            $last = $merged[$merged.Count - 1]
+            if ($i.Start -le $last.End) {
+                if ($i.End -gt $last.End) { $last.End = $i.End }
+            } else {
+                $merged.Add([pscustomobject]@{ Start = $i.Start; End = $i.End })
+            }
+        }
+
+        # The span that reaches the site's most recent data is the one that
+        # matters: a window ends at "now", so coverage is only useful if it
+        # runs back from the recent end without a hole.
+        $latestEnd = ($merged | ForEach-Object { $_.End } | Measure-Object -Maximum).Maximum
+        $contiguous = $merged | Where-Object { $_.End -eq $latestEnd } | Select-Object -First 1
+
+        [pscustomobject]@{
+            Label             = $g.Label
+            ExportCount       = $g.Members.Count
+            ContiguousStartUtc = $contiguous.Start
+            LatestEndUtc      = $latestEnd
+            HasGaps           = ($merged.Count -gt 1)
+            HistoryConfirmed  = -not (@($g.Members | Where-Object { -not $_.HistoryConfirmed }).Count -gt 0)
+        }
+    }
+
+    return @($results)
+}
+
+function New-ConsolidatedDataset {
+    <#
+    .SYNOPSIS
+        The merged exports shaped exactly like one site's dataset.
+    .DESCRIPTION
+        So that Invoke-ReportAnalysis runs UNCHANGED. Its sweep line,
+        percentiles and business-hours handling have been hand-verified
+        against raw OData three times; reimplementing them for merged data
+        would be the worst decision available here.
+
+        Machines, DesktopGroups, Catalogs, Connections and Applications are
+        deliberately empty. The merge export omits them by construction --
+        consolidation needs identity and time only -- so the per-group,
+        per-application and per-device breakdowns cannot be produced from
+        merged data. The report says so rather than rendering empty sections.
+    .OUTPUTS
+        One dataset object, with an extra Consolidation member the
+        single-site path does not have.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][pscustomobject] $Validation,
+        [Parameter(Mandatory)][pscustomobject] $Identity
+    )
+
+    $imports = @($Validation.Usable)
+    $sessions = @(Merge-ConsolidatedSessions -Imports $imports -KeyMap $Identity.KeyMap)
+
+    # One row per (export, user key): who ended up merged with whom, and on
+    # what evidence. This is what makes a consolidated count checkable by the
+    # customer -- joined against each site's own identity-map.csv, which never
+    # leaves that site. Without it the consolidated total is the one number in
+    # the report that nobody can verify, including the people whose estate it
+    # describes.
+    $bridgedKeys = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($b in @($Identity.Bridges)) {
+        foreach ($k in @($b.UserKeys)) { [void] $bridgedKeys.Add([string] $k) }
+    }
+
+    # A key seen in more than one export merged on the identifier alone.
+    $sitesPerKey = @{}
+    foreach ($i in $imports) {
+        $label = [string] $i.Export.site.environmentLabel
+        foreach ($u in @($i.Export.users)) {
+            $k = [string] $u.userKey
+            if ([string]::IsNullOrWhiteSpace($k)) { continue }
+            if (-not $sitesPerKey.ContainsKey($k)) {
+                $sitesPerKey[$k] = New-Object 'System.Collections.Generic.HashSet[string]'
+            }
+            [void] $sitesPerKey[$k].Add($label + '|' + $i.Path)
+        }
+    }
+
+    $identityRows = New-Object System.Collections.Generic.List[object]
+    foreach ($i in $imports) {
+        $label = [string] $i.Export.site.environmentLabel
+        foreach ($u in @($i.Export.users)) {
+            $k = [string] $u.userKey
+            if ([string]::IsNullOrWhiteSpace($k)) { continue }
+
+            # Both can be true at once: a key present in two sites that is
+            # ALSO bridged to a different key in a third. Reported as both,
+            # rather than picking one and hiding the other.
+            $how = @()
+            if ($sitesPerKey[$k].Count -gt 1) { $how += 'Identifier' }
+            if ($bridgedKeys.Contains($k))    { $how += 'UpnBridge' }
+            if ($how.Count -eq 0)             { $how = @('SingleSite') }
+
+            $identityRows.Add([pscustomobject]@{
+                ConsolidatedKey = [string] $Identity.KeyMap[$k]
+                UserKey         = $k
+                Site            = $label
+                # Two sites can report the same label -- "On-premises CVAD
+                # (localhost)" is what a run on the Delivery Controller itself
+                # produces, whichever site it is -- so the file the row came
+                # from is what actually distinguishes them.
+                SourceFile      = [string] $i.Path
+                MatchedBy       = ($how -join '+')
+            })
+        }
+    }
+
+    # One synthetic user row per consolidated identity, so SiteTotals.KnownUsers
+    # counts people rather than export rows.
+    $users = @(@($Identity.KeyMap.Values | Sort-Object -Unique) | ForEach-Object {
+        [pscustomobject]@{ Id = $_; UserName = $_; FullName = $null; Upn = $null; Sid = $null; Domain = $null }
+    })
+
+    # Retention across the set is the earliest instant actually covered.
+    #
+    # This used to take the earliest REQUESTED window start, while claiming in
+    # this very comment to take the earliest covered one. Three exports each
+    # asking for 90 days therefore looked like three sites covering 90 days,
+    # even when one had retained 10 -- and the consolidated report asserted
+    # full 90-day coverage with nothing truncated.
+    #
+    # An export's covered start is the later of what it asked for and what it
+    # actually had. historyStartUtc is absent from exports written before it
+    # existed, and absence is carried as UNCONFIRMED rather than silently
+    # treated as full coverage.
+    #
+    # Gaps are reported separately rather than folded in here, because "no
+    # export covered March" is not the same claim as "history is short".
+    $coverage = @($imports | ForEach-Object {
+        $requested = ([datetime]::Parse([string]$_.Export.windowStartUtc)).ToUniversalTime()
+        $end = ([datetime]::Parse([string]$_.Export.windowEndUtc)).ToUniversalTime()
+
+        $historyStart = $null
+        if ($_.Export.PSObject.Properties['historyStartUtc'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$_.Export.historyStartUtc)) {
+            $historyStart = ([datetime]::Parse([string]$_.Export.historyStartUtc)).ToUniversalTime()
+        }
+
+        $covered = $requested
+        if ($historyStart -and $historyStart -gt $requested) { $covered = $historyStart }
+
+        [pscustomobject]@{
+            Path             = $_.Path
+            EnvironmentLabel = [string] $_.Export.site.environmentLabel
+            # Delivery group ids are GUIDs minted by the site itself, so two
+            # exports sharing any of them came from one site. The same signal
+            # Test-MergeExportSet uses to count repeated sites.
+            DeliveryGroupIds = @($_.Export.site.deliveryGroupIds)
+            RequestedStartUtc = $requested
+            CoverageStartUtc = $covered
+            CoverageEndUtc   = $end
+            HistoryConfirmed = [bool] $historyStart
+        }
+    })
+
+    $ends = @($coverage | ForEach-Object { $_.CoverageEndUtc })
+    $covStarts = @($coverage | ForEach-Object { $_.CoverageStartUtc })
+    $earliest = $(if ($covStarts.Count -gt 0) { ($covStarts | Measure-Object -Minimum).Minimum } else { [datetime]::UtcNow })
+    $latest = $(if ($ends.Count -gt 0) { ($ends | Measure-Object -Maximum).Maximum } else { [datetime]::UtcNow })
+    $availableDays = [int][math]::Floor(($latest - $earliest).TotalDays)
+
+    # The point from which EVERY export has data. A window reaching back
+    # further than this is covered by some sites and not others, so its total
+    # is a lower bound -- which is a different statement from "history is
+    # short", and is reported as its own thing rather than as truncation.
+    $fullCoverageStart = $(if ($covStarts.Count -gt 0) { ($covStarts | Measure-Object -Maximum).Maximum } else { $earliest })
+    $unconfirmed = @($coverage | Where-Object { -not $_.HistoryConfirmed }).Count
+
+    [pscustomobject]@{
+        Sessions             = $sessions
+        Users                = $users
+        Machines             = @()
+        DesktopGroups        = @()
+        Catalogs             = @()
+        Connections          = @()
+        ApplicationInstances = @()
+        Applications         = @()
+        FetchWarnings        = @()
+        IsDemo               = $false
+        SiteIdentity         = [pscustomobject]@{
+            QueriedController    = "Consolidated from $($imports.Count) export(s)"
+            EnvironmentLabel     = 'Consolidated'
+            CustomerId           = $null
+            IsCloud              = $false
+            ControllerFqdns      = @()
+            Agents               = @()
+            ProductVersion       = $null
+            ResourceLocationId   = $null
+            ResourceLocationName = $null
+            Zones                = @()
+            DeliveryGroupIds     = @()
+            CatalogIds           = @()
+            ClockSkewSeconds     = $null
+            BrokerSite           = $null
+            Notes                = @('Consolidated from merge exports. Per-delivery-group, per-application and per-device breakdowns are not available: the merge export omits that data by construction.')
+        }
+        Preflight            = [pscustomobject]@{
+            Reachable             = $true
+            OldestSessionUtc      = $earliest
+            OldestEndedSessionUtc = $earliest
+            HistoryStartUtc       = $earliest
+            RetentionBasis        = 'ConsolidatedExports'
+            AvailableDays         = $availableDays
+            TruncatedWindows      = @()
+            CheckedAtUtc          = [datetime]::UtcNow
+        }
+        Consolidation        = [pscustomobject]@{
+            Inputs        = [object[]] @($imports | ForEach-Object {
+                                [pscustomobject]@{
+                                    Path             = $_.Path
+                                    EnvironmentLabel = $_.Export.site.environmentLabel
+                                    WindowStartUtc   = $_.Export.windowStartUtc
+                                    WindowEndUtc     = $_.Export.windowEndUtc
+                                    HistoryStartUtc  = $_.Export.historyStartUtc
+                                    Anonymized       = [bool]$_.Export.anonymized
+                                    ToolVersion      = $_.Export.toolVersion
+                                } })
+            # What each export actually covers, and the instant from which all
+            # of them do. The report needs both: the first to name which
+            # exports fall short of a window, the second to decide whether any
+            # of them do.
+            Coverage          = [object[]] $coverage
+            # Per SITE, which is the granularity the report must judge by.
+            SiteCoverage      = [object[]] @(Get-ConsolidatedSiteCoverage -Coverage $coverage)
+            FullCoverageStartUtc = $fullCoverageStart
+            UnconfirmedHistory = $unconfirmed
+            Rejected      = [object[]] @($Validation.Rejected)
+            CoverageGaps  = [object[]] @($Validation.CoverageGaps)
+            SitesSeen     = $Validation.SitesSeen
+            RepeatedSites = $Validation.RepeatedSites
+            NaiveCount    = $Identity.NaiveCount
+            SidOnlyCount  = $Identity.SidOnlyCount
+            FinalCount    = $Identity.ConsolidatedCount
+            Bridges       = [object[]] @($Identity.Bridges)
+            ExcludedUpns  = $Identity.ExcludedUpnCount
+            IdentityRows  = [object[]] $identityRows.ToArray()
+        }
+    }
+}
+
+function Get-ConsolidatedDatasetFromPaths {
+    <#
+    .SYNOPSIS
+        The whole consolidation pipeline, from file paths to one dataset.
+    .DESCRIPTION
+        Kept as one function so the orchestrator's fetch branch reads as a
+        single alternative to contacting a site, rather than as five steps
+        that only make sense together.
+
+        Directories are accepted as well as files, because the exports live in
+        timestamped run directories and asking a customer to name each file
+        exactly is asking for a typo.
+    .OUTPUTS
+        One dataset object, shaped for Invoke-ReportAnalysis.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]] $Paths,
+        [switch] $UseUpnBridge,
+        [AllowNull()][string[]] $ExcludeBridgeUpn,
+        [AllowNull()][string] $SaltPath,
+        [Parameter(Mandatory)][string] $DefaultSaltDirectory
+    )
+
+    $files = New-Object System.Collections.Generic.List[string]
+    # Paths that resolved to nothing at all, kept separate from files that
+    # exist but turn out to be unusable. A supplied path that simply is not
+    # there deserves a message naming what to look for, not the generic
+    # "none of these could be consolidated" that a malformed export gets.
+    $unresolved = New-Object System.Collections.Generic.List[string]
+
+    foreach ($p in @($Paths)) {
+        if ([string]::IsNullOrWhiteSpace($p)) { continue }
+
+        if (Test-Path -LiteralPath $p -PathType Container) {
+            $found = @(Get-ChildItem -LiteralPath $p -Recurse -Filter 'merge-export.json' -ErrorAction SilentlyContinue)
+            if ($found.Count -eq 0) {
+                $unresolved.Add($p)
+            } else {
+                foreach ($f in $found) { $files.Add($f.FullName) }
+            }
+        } elseif (Test-Path -LiteralPath $p) {
+            $files.Add($p)
+        } else {
+            $unresolved.Add($p)
+        }
+    }
+
+    if ($files.Count -eq 0) {
+        throw "No merge export was found at: $($unresolved -join ', '). The file is named merge-export.json and is produced by a run with -ExportForMerge. Supply the file itself, or a folder to search."
+    }
+    foreach ($u in $unresolved) {
+        Write-ReportLog -Level Warn -Message "No merge-export.json was found at $u. It is produced by a run with -ExportForMerge; this path contributes nothing to the consolidated report."
+    }
+
+    Write-ReportLog -Level Info -Message "Consolidating $($files.Count) merge export(s)..."
+
+    $imports = @($files | ForEach-Object { Import-MergeExport -Path $_ })
+    $validation = Test-MergeExportSet -Imports $imports
+
+    foreach ($r in @($validation.Rejected)) {
+        Write-ReportLog -Level Warn -Message "Not using $($r.Path): $($r.Reason)"
+    }
+    if (@($validation.Usable).Count -eq 0) {
+        throw 'None of the supplied merge exports can be consolidated together. See the warnings above for why.'
+    }
+
+    # Under anonymization the operator names a user principal name but the
+    # export carries only its derived key, so the exclusion has to be derived
+    # the same way, under the same salt.
+    $excludeKeys = @()
+    if ($ExcludeBridgeUpn -and @($ExcludeBridgeUpn).Count -gt 0) {
+        $excludeSalt = $null
+        if ([bool]$validation.Anonymized) {
+            $sp = $SaltPath
+            if ([string]::IsNullOrWhiteSpace($sp)) { $sp = Join-Path $DefaultSaltDirectory 'anonymization-salt.txt' }
+            if (-not (Test-Path -LiteralPath $sp)) {
+                throw "-ExcludeBridgeUpn needs the anonymization salt, because these exports carry derived keys rather than user principal names. Point -SaltPath at the salt file the exports were created with."
+            }
+            $excludeSalt = (Get-ReportSalt -Path $sp).Salt
+        }
+        $excludeKeys = @($ExcludeBridgeUpn | ForEach-Object { Get-UpnBridgeKey -Upn $_ -Salt $excludeSalt } | Where-Object { $_ })
+    }
+
+    $identity = Resolve-ConsolidatedIdentity -Imports @($validation.Usable) `
+        -UseUpnBridge:$UseUpnBridge -ExcludeBridgeKey $excludeKeys
+
+    Write-ReportLog -Level Success -Message "Consolidated $($identity.NaiveCount) user record(s) into $($identity.ConsolidatedCount) unique user(s) ($($identity.SidOnlyCount) after identifier matching alone)."
+
+    foreach ($b in @($identity.Bridges | Where-Object { $_.IsSuspect })) {
+        Write-ReportLog -Level Warn -Message "The name match on $($b.BridgeKey) joined $(@($b.UserKeys).Count) account(s) across $(@($b.ForestKeys).Count) directories. One person with that many accounts is possible, and so is a name collision. Verify it, or exclude it with -ExcludeBridgeUpn."
+    }
+
+    foreach ($g in @($validation.CoverageGaps)) {
+        Write-ReportLog -Level Warn -Message ("No export covers {0:yyyy-MM-dd} to {1:yyyy-MM-dd}. Figures spanning that period are a lower bound, not a count." -f $g.FromUtc, $g.ToUtc)
+    }
+
+    return (New-ConsolidatedDataset -Validation $validation -Identity $identity)
+}
+
+# endregion 87-Consolidate.ps1
 
 # ----------------------------------------------------------------------------
 # region 90-Gui.ps1
@@ -4817,7 +7977,7 @@ function Test-GuiAvailable {
     [OutputType([bool])]
     param()
 
-    if ($env:CITRIXAUDIT_FORCE_CONSOLE) { return $false }
+    if ($env:CITRIXUSAGEREPORT_FORCE_CONSOLE) { return $false }
 
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
@@ -4837,7 +7997,7 @@ function ConvertTo-DaysArray {
         rather than rejected: a typo should not make the operator start over.
 
         Values above 1000 days are also dropped. 1000 is comfortably above
-        the maximum Citrix Monitor retention on a Premium licence (90 days),
+        the maximum Citrix Monitor retention on a Premium license (90 days),
         so nothing legitimate is lost by the ceiling -- but with no ceiling
         at all, a single stray extra digit (-Days 99999) used to be accepted
         silently: the log would report "Windows: 99999 day(s)", demo
@@ -4874,7 +8034,7 @@ function ConvertTo-DaysArray {
 
     if ($droppedForRange.Count -gt 0) {
         $droppedList = ($droppedForRange | Sort-Object -Unique) -join ', '
-        Write-AuditLog -Level Warn -Message "Ignored reporting window(s) over the $maxDays-day maximum: $droppedList."
+        Write-ReportLog -Level Warn -Message "Ignored reporting window(s) over the $maxDays-day maximum: $droppedList."
     }
 
     $result = @($values | Sort-Object -Unique)
@@ -4913,7 +8073,7 @@ function Get-CappedFormClientHeight {
     .SYNOPSIS
         The form's target ClientSize height, capped to fit the screen.
     .DESCRIPTION
-        Pulled out of Show-AuditGui's dialog construction so the fit-to-
+        Pulled out of Show-ReportGui's dialog construction so the fit-to-
         screen arithmetic is testable without driving a modal dialog -- the
         same reason Get-GuiEnvironmentName and New-InteractiveCredential
         exist in this file. This is also the exact arithmetic that, worked
@@ -4958,7 +8118,7 @@ function New-InteractiveCredential {
         different Windows account. This is the decision behind that choice,
         pulled out of both click handlers/prompts so it is testable without
         driving a modal dialog -- the same reason Get-GuiEnvironmentName
-        exists in this file. $null flows straight to New-AuditConfig
+        exists in this file. $null flows straight to New-ReportConfig
         -Credential, which is what makes Get-AuthRequestParameters
         (src/30-Auth.ps1) fall back to -UseDefaultCredentials.
     #>
@@ -4985,12 +8145,62 @@ function New-InteractiveCredential {
     return [System.Management.Automation.PSCredential]::new($UserName, $pw)
 }
 
-function Show-AuditGui {
+function Get-GuiPalette {
     <#
     .SYNOPSIS
-        Shows the configuration dialog and returns a config object.
+        The brand palette as System.Drawing.Color, keyed the same as
+        Get-BrandPalette.
+    .DESCRIPTION
+        New-ReportGuiForm used to compute this as a HexColor closure over its
+        own locals, which is exactly what made it unreachable from a second
+        file. src/92-RunPanel.ps1 needs the same two colours ($cobalt,
+        $canvas) to draw with, and the choice here is to promote the
+        conversion to a function both files can call rather than have the
+        run panel duplicate the hex literals or reimplement the parse -- one
+        wrong digit copied into a second place is how a brand colour drifts.
     .OUTPUTS
-        The configuration, or $null if the operator cancelled.
+        hashtable: the same keys Get-BrandPalette returns, each value a
+        System.Drawing.Color instead of a hex string.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    # Callable before New-ReportGuiForm or Test-GuiAvailable has run, so this
+    # cannot assume System.Drawing is already loaded.
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+
+    $hex = Get-BrandPalette
+    $colors = @{}
+    foreach ($key in $hex.Keys) {
+        $h = $hex[$key].TrimStart('#')
+        $colors[$key] = [System.Drawing.Color]::FromArgb(
+            [Convert]::ToInt32($h.Substring(0,2),16),
+            [Convert]::ToInt32($h.Substring(2,2),16),
+            [Convert]::ToInt32($h.Substring(4,2),16))
+    }
+    return $colors
+}
+
+function New-ReportGuiForm {
+    <#
+    .SYNOPSIS
+        Builds the configuration dialog without showing it.
+    .DESCRIPTION
+        Separated from Show-ReportGui so the form can be inspected without a
+        message loop. A modal ShowDialog cannot be driven from a test: an
+        attempt to poll it from a second runspace deadlocks, so a layout
+        defect -- two controls sharing a position, a control clipped outside
+        its group -- was only discoverable by a person opening the window and
+        noticing. One such defect shipped: the merge checkbox and the demo
+        checkbox were assigned the same position, so the merge checkbox sat
+        underneath and could never be clicked.
+
+        Construction and presentation being separate is the ordinary fix, and
+        it makes the geometry assertable.
+    .OUTPUTS
+        An object with Form and Controls, the latter a hashtable keyed by the
+        names the tests and the caller use.
     #>
     [CmdletBinding()]
     param([string] $DefaultOutputPath)
@@ -4998,19 +8208,55 @@ function Show-AuditGui {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
-    $p = Get-BrandPalette
-    function HexColor([string] $Hex) {
-        $h = $Hex.TrimStart('#')
-        [System.Drawing.Color]::FromArgb(
-            [Convert]::ToInt32($h.Substring(0,2),16),
-            [Convert]::ToInt32($h.Substring(2,2),16),
-            [Convert]::ToInt32($h.Substring(4,2),16))
-    }
+    # Commands this dialog's event handlers need, captured as variables.
+    #
+    # Every handler below is a .GetNewClosure() scriptblock, which is what
+    # keeps it working after this function has returned. A closure is bound to
+    # a FRESH MODULE scope, and command lookup from a module scope falls back
+    # to GLOBAL -- not to the scope that loaded this script. So a bare
+    # function name inside a handler resolves only when the script happens to
+    # be running at the top level.
+    #
+    # A customer hit exactly that: loading the script into a nested scope --
+    # `powershell -Command "& { .\CitrixUsageReport.ps1 }"`, or dot-sourcing
+    # it from a wrapper script -- and clicking Run produced
+    #   The term 'New-InteractiveCredential' is not recognized...
+    # while the identical script run with -File worked.
+    #
+    # Capturing the command as a VARIABLE sidesteps command lookup entirely:
+    # closures capture variables reliably, and the captured scriptblock keeps
+    # its own session state, so the function's own internal calls still
+    # resolve. Verified in both scopes.
+    $fnGetSaltFileInfo         = ${function:Get-SaltFileInfo}
+    $fnGetReportSalt           = ${function:Get-ReportSalt}
+    $fnImportMergeExport       = ${function:Import-MergeExport}
+    $fnTestMergeExportSet      = ${function:Test-MergeExportSet}
+    $fnGetGuiEnvironmentName   = ${function:Get-GuiEnvironmentName}
+    $fnNewInteractiveCredential = ${function:New-InteractiveCredential}
+    $fnConvertToDaysArray      = ${function:ConvertTo-DaysArray}
+    $fnNewReportConfig         = ${function:New-ReportConfig}
+    $fnTestReportConfig        = ${function:Test-ReportConfig}
+    # The run page. These live in src/15-RunChannel.ps1, src/92-RunPanel.ps1
+    # and src/93-RunHost.ps1, which the build concatenates AFTER this file --
+    # harmless, because ${function:...} is read when New-ReportGuiForm RUNS,
+    # by which point the whole script has been parsed and every function
+    # exists. They are captured for the same reason as the nine above: the
+    # handlers that call them are closures, and a closure's command lookup
+    # falls back to global.
+    $fnGetRunPhaseList         = ${function:Get-RunPhaseList}
+    $fnNewRunPanelControls     = ${function:New-RunPanelControls}
+    $fnUpdateRunPanel          = ${function:Update-RunPanel}
+    $fnNewRunChannel           = ${function:New-RunChannel}
+    $fnReadRunEvents           = ${function:Read-RunEvents}
+    $fnStartReportWorker       = ${function:Start-ReportWorker}
+    $fnStopReportWorkerAsync   = ${function:Stop-ReportWorkerAsync}
+    $fnGetReportBootstrapPath  = ${function:Get-ReportBootstrapPath}
 
-    $jasper = HexColor $p['Jasper80']
-    $cobalt = HexColor $p['Cobalt50']
-    $canvas = HexColor $p['Canvas20']
-    $mint   = HexColor $p['Mint40']
+    $p = Get-GuiPalette
+    $jasper = $p['Jasper80']
+    $cobalt = $p['Cobalt50']
+    $canvas = $p['Canvas20']
+    $mint   = $p['Mint40']
 
     # Funnel Display and Public Sans are usually absent on a customer machine,
     # so the dialog asks for them and lets GDI fall back to a system font.
@@ -5029,7 +8275,7 @@ function Show-AuditGui {
     #   |                           content is taller than    |
     #   |                           the visible area          |
     #   +----------------------------------------------------+
-    #   | action bar (Dock=Bottom) -- Run audit / Close,      |
+    #   | action bar (Dock=Bottom) -- Run Report / Close,      |
     #   |                              always visible          |
     #   +----------------------------------------------------+
     #
@@ -5046,12 +8292,32 @@ function Show-AuditGui {
     # way round.
     $headerHeight = 78
     $actionBarHeight = 64
+    # Its own docked strip, because the status line is the ONLY place a
+    # rejected configuration is explained and it used to sit inside the
+    # scrolling panel, below the fold in every environment -- 59px on
+    # premises, 131px for the cloud layouts, 197px when combining. Clicking
+    # Run with a bad configuration wrote the correct message 59px below
+    # anything the operator could see, with the scroll position still at 0,
+    # so the window simply appeared to do nothing.
+    $statusStripHeight = 42
     $formWidth = 640
 
     $content = New-Object System.Windows.Forms.Panel
     $content.Dock = 'Fill'
     $content.AutoScroll = $true
     $content.BackColor = $canvas
+
+    # The run page lives here, in the same client area $content occupies, and
+    # the two are never visible at once. A host panel rather than the run
+    # panel itself, because the run panel is rebuilt from scratch for every
+    # run (its phase column is whatever THAT configuration will actually do)
+    # -- rebuilding a child of this host never disturbs the form's own
+    # Controls collection, and so cannot disturb the docking order, which is
+    # applied in reverse z-order and is easy to break silently.
+    $runHost = New-Object System.Windows.Forms.Panel
+    $runHost.Dock = 'Fill'
+    $runHost.BackColor = $canvas
+    $runHost.Visible = $false
 
     $header = New-Object System.Windows.Forms.Panel
     $header.Dock = 'Top'
@@ -5063,6 +8329,19 @@ function Show-AuditGui {
     $actionBar.Height = $actionBarHeight
     $actionBar.BackColor = $canvas
 
+    # Zero-height until there is something to say, then $statusStripHeight.
+    #
+    # Reserving the space permanently costs 42px on every run for a strip that
+    # is empty almost always, and this dialog already has to fit an RDP
+    # session and a laptop -- the measured working area here is 866px, which
+    # the cloud and combine layouts already exceed. Growing on demand keeps
+    # the quiet case unchanged and still puts the message outside the
+    # scrolling panel, where it cannot be scrolled away from.
+    $statusStrip = New-Object System.Windows.Forms.Panel
+    $statusStrip.Dock = 'Bottom'
+    $statusStrip.Height = 0
+    $statusStrip.BackColor = $canvas
+
     # Fill first, then Top, then Bottom -- see the note above.
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Citrix Usage Report'
@@ -5072,7 +8351,18 @@ function Show-AuditGui {
     $form.BackColor = $canvas
     $form.Font = $bodyFont
     $form.Controls.Add($content)
+    # Added with the other Fill-docked control and BEFORE the header, the
+    # status strip and the action bar, so that when it is shown the docked
+    # edges still belong to those three. It is hidden, and a hidden control
+    # takes part in no dock layout at all, so it costs the configuration page
+    # nothing while that page is the one on screen.
+    $form.Controls.Add($runHost)
     $form.Controls.Add($header)
+    # Added BEFORE the action bar on purpose. Docking is applied in reverse
+    # z-order -- the last control added docks first and takes the outermost
+    # edge -- so the action bar must be added last to stay against the
+    # bottom, leaving this strip immediately above it.
+    $form.Controls.Add($statusStrip)
     $form.Controls.Add($actionBar)
 
     # Give the form its real target width right away, before any anchored
@@ -5124,18 +8414,35 @@ function Show-AuditGui {
     $envBox.Location = New-Object System.Drawing.Point(24, $y)
     $envBox.Size = New-Object System.Drawing.Size(570, 24)
     $envBox.Anchor = 'Top, Left, Right'
-    # Order matters: it must line up exactly with Get-GuiEnvironmentName.
+    # The first four must line up exactly with Get-GuiEnvironmentName.
+    #
+    # The fifth is not a Citrix environment: it builds a report from exports
+    # already on disk and contacts nothing. It belongs here anyway, because
+    # the dropdown asks the one question it answers -- where does the data
+    # come from -- and because putting it here makes the connection fields
+    # disappear through the same relayout every other choice already uses.
+    # Get-GuiEnvironmentName is deliberately NOT extended to cover it: that
+    # mapping routes credentials to sovereign cloud endpoints, and widening
+    # its range to include a non-environment is how an off-by-one there would
+    # start being possible.
     [void] $envBox.Items.AddRange(@(
         'On-premises CVAD (Delivery Controller)',
         'Citrix Cloud - Commercial (US / EU / Asia Pacific South)',
         'Citrix Cloud - Japan',
-        'Citrix Cloud Government (US Gov)'
+        'Citrix Cloud Government (US Gov)',
+        'Combine saved exports from several sites (no connection)'
     ))
+    $consolidateIndex = 4
     $envBox.SelectedIndex = 0
     $content.Controls.Add($envBox)
     $y += 36
 
-    $content.Controls.Add((New-Label 'Delivery Controller hostname' $y))
+    # The top of the region whose contents depend on the environment. The
+    # relayout below rewrites every position from here down, so this is the
+    # one coordinate it has to remember.
+    $variableTop = $y
+    $serverLabel = New-Label 'Delivery Controller hostname' $y
+    $content.Controls.Add($serverLabel)
     $y += 22
     $serverBox = New-Object System.Windows.Forms.TextBox
     $serverBox.Location = New-Object System.Drawing.Point(24, $y)
@@ -5160,11 +8467,21 @@ function Show-AuditGui {
     # customer who already worked out their Monitor Service is HTTP-only)
     # wins over whatever the dropdown was last set to, and the dropdown
     # updates to say so rather than silently disagreeing with what was typed.
+    # Every scriptblock below is given an explicit closure.
+    #
+    # While the dialog was shown from inside the function that built it, the
+    # builder's scope stayed alive for as long as the window did, and handlers
+    # resolved $serverBox, $txtSalt and the rest by ordinary lookup. Splitting
+    # construction from presentation ends that: the form outlives
+    # New-ReportGuiForm, so by the time a handler runs its scope is gone and
+    # every variable it names is $null -- which surfaces as "You cannot call a
+    # method on a null-valued expression" from inside a click, not at build
+    # time. GetNewClosure captures the variables with the scriptblock.
     $serverBox.Add_TextChanged({
         if ($serverBox.Text -match '^\s*(https?)://') {
             $protocolBox.SelectedIndex = if ($matches[1] -eq 'http') { 1 } else { 0 }
         }
-    })
+    }.GetNewClosure())
     $content.Controls.AddRange(@($serverBox, $protocolBox))
     $y += 36
 
@@ -5231,13 +8548,13 @@ function Show-AuditGui {
             $status.ForeColor = [System.Drawing.Color]::Firebrick
             $status.Text = "Couldn't open a browser. Documentation: $cloudDocsUrl"
         }
-    })
+    }.GetNewClosure())
     $content.Controls.Add($cloudDocsLink)
     $y += 30
 
     # On-premises authentication choice. Defaults to the signed-in user (the
-    # long-standing behaviour); "Use a different account" reveals a username
-    # and masked password field, mirrored by Read-AuditConfigFromConsole's
+    # long-standing behavior); "Use a different account" reveals a username
+    # and masked password field, mirrored by Read-ReportConfigFromConsole's
     # console prompt below so the two entry points offer the same choice.
     # Single column, stacked, not a side-by-side pair: see the note above
     # the "Include in the report" GroupBox about why this file avoids a
@@ -5281,37 +8598,9 @@ function Show-AuditGui {
     $content.Controls.Add($acctPassBox)
     $y += 36
 
-    # Cloud fields are meaningless on-premises and vice versa, so only the
-    # relevant set is enabled; the account fields are further gated on
-    # "Use a different account" actually being selected.
-    $updateFields = {
-        $isCloud = $envBox.SelectedIndex -gt 0
-        $serverBox.Enabled = -not $isCloud
-        $protocolBox.Enabled = -not $isCloud
-        $customerLabel.Enabled = $isCloud
-        $customerBox.Enabled = $isCloud
-        $clientIdLabel.Enabled = $isCloud
-        $clientIdBox.Enabled = $isCloud
-        $secretLabel.Enabled = $isCloud
-        $secretBox.Enabled = $isCloud
-        $cloudDocsLink.Enabled = $isCloud
 
-        $authLabel.Enabled = -not $isCloud
-        $rbCurrentUser.Enabled = -not $isCloud
-        $rbDifferentAccount.Enabled = -not $isCloud
-
-        $useDifferentAccount = (-not $isCloud) -and $rbDifferentAccount.Checked
-        $acctUserLabel.Enabled = $useDifferentAccount
-        $acctUserBox.Enabled = $useDifferentAccount
-        $acctPassLabel.Enabled = $useDifferentAccount
-        $acctPassBox.Enabled = $useDifferentAccount
-    }
-    $envBox.Add_SelectedIndexChanged($updateFields)
-    $rbCurrentUser.Add_CheckedChanged($updateFields)
-    $rbDifferentAccount.Add_CheckedChanged($updateFields)
-    & $updateFields
-
-    $content.Controls.Add((New-Label 'Reporting windows, in days' $y))
+    $daysLabel = New-Label 'Reporting windows, in days' $y
+    $content.Controls.Add($daysLabel)
     $y += 22
     $daysBox = New-Object System.Windows.Forms.TextBox
     $daysBox.Text = '30,60,90'
@@ -5320,7 +8609,8 @@ function Show-AuditGui {
     $content.Controls.Add($daysBox)
     $y += 36
 
-    $content.Controls.Add((New-Label 'Output folder' $y))
+    $outLabel = New-Label 'Output folder' $y
+    $content.Controls.Add($outLabel)
     $y += 22
     $outBox = New-Object System.Windows.Forms.TextBox
     $outBox.Text = $DefaultOutputPath
@@ -5335,14 +8625,14 @@ function Show-AuditGui {
     $browse.Add_Click({
         $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
         if ($dlg.ShowDialog() -eq 'OK') { $outBox.Text = $dlg.SelectedPath }
-    })
+    }.GetNewClosure())
     $content.Controls.AddRange(@($outBox, $browse))
     $y += 40
 
     $group = New-Object System.Windows.Forms.GroupBox
     $group.Text = 'Include in the report'
     $group.Location = New-Object System.Drawing.Point(24, $y)
-    $group.Size = New-Object System.Drawing.Size(570, 206)
+    $group.Size = New-Object System.Drawing.Size(570, 318)
     $group.Anchor = 'Top, Left, Right'
 
     # Single column, not the two-column grid this used to be: at x=340 (the
@@ -5379,6 +8669,137 @@ function Show-AuditGui {
     $cbAnon.Location = New-Object System.Drawing.Point(16, 122)
     $cbAnon.Size = New-Object System.Drawing.Size(500, 22)
 
+    # Combining several sites needs one stable key per person, which needs
+    # one salt file reused by every export. The path is exposed rather than
+    # hidden because that file has to be the SAME one at every site, and a
+    # customer cannot satisfy that without being able to point at it.
+    $cbMerge = New-Object System.Windows.Forms.CheckBox
+    $cbMerge.Text = 'Also export data for combining with other sites'
+    $cbMerge.Location = New-Object System.Drawing.Point(16, 194)
+    $cbMerge.Size = New-Object System.Drawing.Size(500, 22)
+
+    $lblSalt = New-Object System.Windows.Forms.Label
+    $lblSalt.Text = 'Shared key file (keep it; use the same file at every site)'
+    $lblSalt.Location = New-Object System.Drawing.Point(36, 218)
+    $lblSalt.Size = New-Object System.Drawing.Size(480, 18)
+    $lblSalt.Enabled = $false
+
+    $txtSalt = New-Object System.Windows.Forms.TextBox
+    $txtSalt.Location = New-Object System.Drawing.Point(36, 238)
+    $txtSalt.Size = New-Object System.Drawing.Size(292, 22)
+    $txtSalt.Enabled = $false
+
+    # Two buttons, because there are two different intentions and choosing the
+    # wrong one is not recoverable. The first site CREATES the key; every
+    # other site USES the one already made. A single Browse button made those
+    # look like the same action, and picking wrongly produces exports that
+    # look entirely normal and can never be consolidated with the others.
+    $btnSaltNew = New-Object System.Windows.Forms.Button
+    $btnSaltNew.Text = 'Create new'
+    $btnSaltNew.Location = New-Object System.Drawing.Point(336, 237)
+    $btnSaltNew.Size = New-Object System.Drawing.Size(94, 24)
+    $btnSaltNew.Enabled = $false
+
+    $btnSalt = New-Object System.Windows.Forms.Button
+    $btnSalt.Text = 'Use existing'
+    $btnSalt.Location = New-Object System.Drawing.Point(440, 237)
+    $btnSalt.Size = New-Object System.Drawing.Size(94, 24)
+    $btnSalt.Enabled = $false
+
+    # Says what the chosen path actually is, now, rather than leaving the
+    # operator to discover it when the run fails. The fingerprint is the part
+    # that matters: at the second site it is compared by eye against what the
+    # first site showed, which is the only check that the two will consolidate.
+    $lblSaltStatus = New-Object System.Windows.Forms.Label
+    $lblSaltStatus.Location = New-Object System.Drawing.Point(36, 266)
+    $lblSaltStatus.Size = New-Object System.Drawing.Size(498, 32)
+    $lblSaltStatus.Enabled = $false
+
+    $refreshSaltStatus = {
+        $path = $txtSalt.Text
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            $lblSaltStatus.ForeColor = [System.Drawing.Color]::DimGray
+            $lblSaltStatus.Text = 'No file chosen. A new key will be created beside the report, which is correct for the FIRST site only.'
+            return
+        }
+
+        $info = & $fnGetSaltFileInfo -Path $path
+        if ($info.Valid) {
+            $lblSaltStatus.ForeColor = [System.Drawing.Color]::ForestGreen
+            $lblSaltStatus.Text = "Existing key, fingerprint $($info.Fingerprint.Substring(0, 8)). Every site you intend to combine must show this same value."
+        } elseif ($info.Exists) {
+            $lblSaltStatus.ForeColor = [System.Drawing.Color]::Firebrick
+            $lblSaltStatus.Text = "Not a usable key file. $($info.Error)"
+        } else {
+            $lblSaltStatus.ForeColor = [System.Drawing.Color]::DarkGoldenrod
+            $lblSaltStatus.Text = 'No key file there yet. One will be created when the report runs -- correct for the first site, wrong if the other sites already have one.'
+        }
+    }.GetNewClosure()
+
+    $txtSalt.Add_TextChanged($refreshSaltStatus)
+
+    $btnSaltNew.Add_Click({
+        $dlg = New-Object System.Windows.Forms.SaveFileDialog
+        $dlg.Title = 'Create a shared key file'
+        $dlg.Filter = 'Key file (*.txt)|*.txt|All files (*.*)|*.*'
+        $dlg.FileName = 'anonymization-salt.txt'
+        $dlg.OverwritePrompt = $true    # overwriting an existing key destroys it
+        if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+        try {
+            # Created now, not at run time, so the operator can see the
+            # fingerprint and copy the file to the other sites before
+            # committing to anything.
+            $created = & $fnGetReportSalt -Path $dlg.FileName
+            $txtSalt.Text = $created.Path
+            # Not redundant with the TextChanged handler: creating over the
+            # path already in the box leaves the text identical, so nothing
+            # fires, and the status line would keep showing the fingerprint of
+            # the key that was just replaced.
+            & $refreshSaltStatus
+            [System.Windows.Forms.MessageBox]::Show(
+                "A shared key file was created:`n`n$($created.Path)`n`nFingerprint: $($created.Fingerprint.Substring(0, 8))`n`nKEEP THIS FILE, and use the same copy at every site you intend to combine. Losing it permanently ends the ability to join future exports to the ones you already have.",
+                'Shared key file created',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        } catch {
+            $lblSaltStatus.ForeColor = [System.Drawing.Color]::Firebrick
+            $lblSaltStatus.Text = "Could not create the key file: $($_.Exception.Message)"
+        }
+    }.GetNewClosure())
+
+    $btnSalt.Add_Click({
+        # Open, not Save: this button is for a key that already exists, and an
+        # open dialog will not offer to create one by accident.
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Title = 'Use the shared key file from another site'
+        $dlg.Filter = 'Key file (*.txt)|*.txt|All files (*.*)|*.*'
+        $dlg.CheckFileExists = $true
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $txtSalt.Text = $dlg.FileName
+            & $refreshSaltStatus
+        }
+    }.GetNewClosure())
+
+    # The salt only exists to make pseudonyms stable across sites, so it is
+    # meaningless without anonymization, and a merge export without
+    # anonymization carries raw identifiers. Ticking this ticks that.
+    $cbMerge.Add_CheckedChanged({
+        $on = $cbMerge.Checked
+        $lblSalt.Enabled = $on
+        $txtSalt.Enabled = $on
+        $btnSalt.Enabled = $on
+        $btnSaltNew.Enabled = $on
+        $lblSaltStatus.Enabled = $on
+        if ($on) { & $refreshSaltStatus }
+        if ($on) {
+            $cbAnon.Checked = $true
+            $cbAnon.Enabled = $false
+        } else {
+            $cbAnon.Enabled = $true
+        }
+    }.GetNewClosure())
+
     $cbExport = New-Object System.Windows.Forms.CheckBox
     $cbExport.Text = 'Export raw data (JSON + CSV)'
     $cbExport.Location = New-Object System.Drawing.Point(16, 146)
@@ -5390,16 +8811,318 @@ function Show-AuditGui {
     $cbDemo.Location = New-Object System.Drawing.Point(16, 170)
     $cbDemo.Size = New-Object System.Drawing.Size(500, 22)
 
-    $group.Controls.AddRange(@($cbGroups, $cbApps, $cbDevices, $cbTrend, $cbAnon, $cbExport, $cbDemo))
+    $group.Controls.AddRange(@($cbGroups, $cbApps, $cbDevices, $cbTrend, $cbAnon, $cbExport, $cbDemo, $cbMerge, $lblSalt, $txtSalt, $btnSalt, $btnSaltNew, $lblSaltStatus))
     $content.Controls.Add($group)
-    $y += 222
+    # Advanced only so the status label below is built somewhere sane; the
+    # relayout rewrites both positions from the real group height.
+    $y += ($group.Height + 16)
 
+
+    # In the docked strip, not in $content: always visible, whatever the
+    # environment and wherever the panel is scrolled to.
     $status = New-Object System.Windows.Forms.Label
-    $status.Location = New-Object System.Drawing.Point(24, $y)
-    $status.Size = New-Object System.Drawing.Size(570, 20)
+    $status.Location = New-Object System.Drawing.Point(24, 8)
+    $status.Size = New-Object System.Drawing.Size(($formWidth - 48), 28)
     $status.Anchor = 'Top, Left, Right'
-    $status.ForeColor = HexColor $p['Jasper80']
-    $content.Controls.Add($status)
+    $status.ForeColor = $p['Jasper80']
+    $statusStrip.Controls.Add($status)
+
+    # One place decides whether the strip is showing, driven by whether the
+    # label has anything in it -- so every caller that sets $status.Text (the
+    # Run handler's refusal, the cloud documentation link's failure) gets the
+    # strip for free and none of them has to remember.
+    $status.Add_TextChanged({
+        $statusStrip.Height = $(
+            if ([string]::IsNullOrWhiteSpace($status.Text)) { 0 } else { $statusStripHeight })
+    }.GetNewClosure())
+
+    # ---- Combining saved exports ------------------------------------------
+    # Shown only for the "Combine saved exports" environment, which contacts
+    # nothing and reads merge-export.json files already on disk.
+    #
+    # The list holds resolved FILES, never folders, even though -Merge accepts
+    # both. Adding a folder searches it and adds what it found, so what the
+    # operator sees listed is exactly what will be combined -- a folder shown
+    # as one line would be a promise about its contents that nothing checks
+    # until the run.
+    $mergePathList = New-Object System.Collections.Generic.List[string]
+
+    $mergeLabel = New-Object System.Windows.Forms.Label
+    $mergeLabel.Text = 'Exports to combine (merge-export.json, one per site or per export date)'
+    $mergeLabel.Location = New-Object System.Drawing.Point(24, $y)
+    $mergeLabel.Size = New-Object System.Drawing.Size(570, 20)
+    $mergeLabel.Anchor = 'Top, Left, Right'
+    $content.Controls.Add($mergeLabel)
+
+    $mergeListBox = New-Object System.Windows.Forms.ListBox
+    $mergeListBox.Location = New-Object System.Drawing.Point(24, ($y + 22))
+    $mergeListBox.Size = New-Object System.Drawing.Size(570, 82)
+    $mergeListBox.Anchor = 'Top, Left, Right'
+    $mergeListBox.SelectionMode = 'MultiExtended'
+    $mergeListBox.IntegralHeight = $false
+    $content.Controls.Add($mergeListBox)
+
+    $btnMergeFiles = New-Object System.Windows.Forms.Button
+    $btnMergeFiles.Text = 'Add files...'
+    $btnMergeFiles.Location = New-Object System.Drawing.Point(24, ($y + 108))
+    $btnMergeFiles.Size = New-Object System.Drawing.Size(104, 26)
+    $content.Controls.Add($btnMergeFiles)
+
+    $btnMergeFolder = New-Object System.Windows.Forms.Button
+    $btnMergeFolder.Text = 'Add folder...'
+    $btnMergeFolder.Location = New-Object System.Drawing.Point(134, ($y + 108))
+    $btnMergeFolder.Size = New-Object System.Drawing.Size(104, 26)
+    $content.Controls.Add($btnMergeFolder)
+
+    $btnMergeRemove = New-Object System.Windows.Forms.Button
+    $btnMergeRemove.Text = 'Remove'
+    $btnMergeRemove.Location = New-Object System.Drawing.Point(244, ($y + 108))
+    $btnMergeRemove.Size = New-Object System.Drawing.Size(104, 26)
+    $content.Controls.Add($btnMergeRemove)
+
+    # The only check that the chosen exports will actually combine, and the
+    # only place a refusal can be seen before the run starts.
+    # Test-MergeExportSet rejects a whole set for disagreeing salts or mixed
+    # anonymization, because in both cases a shared person is counted twice
+    # and no number in the finished report looks wrong.
+    $mergeStatus = New-Object System.Windows.Forms.Label
+    $mergeStatus.Location = New-Object System.Drawing.Point(24, ($y + 140))
+    $mergeStatus.Size = New-Object System.Drawing.Size(570, 44)
+    $mergeStatus.Anchor = 'Top, Left, Right'
+    $content.Controls.Add($mergeStatus)
+
+    $cbUpnBridge = New-Object System.Windows.Forms.CheckBox
+    $cbUpnBridge.Text = 'Also match people across directories by user principal name'
+    $cbUpnBridge.Location = New-Object System.Drawing.Point(24, ($y + 188))
+    $cbUpnBridge.Size = New-Object System.Drawing.Size(570, 22)
+    $cbUpnBridge.Checked = $false
+    $content.Controls.Add($cbUpnBridge)
+
+    $lblUpnCaveat = New-Object System.Windows.Forms.Label
+    $lblUpnCaveat.Text = 'Off by default. A name match is weaker evidence than a security identifier: one person holding accounts in two forests, and two different people who happen to share a name, produce identical evidence. Leave this off unless you know the estate spans forests.'
+    $lblUpnCaveat.Location = New-Object System.Drawing.Point(42, ($y + 210))
+    $lblUpnCaveat.Size = New-Object System.Drawing.Size(552, 48)
+    $lblUpnCaveat.Anchor = 'Top, Left, Right'
+    $content.Controls.Add($lblUpnCaveat)
+
+    # Re-reads every listed file and says what the set amounts to. Cheap
+    # enough to run on every change: these are small JSON documents, and the
+    # alternative is an operator discovering a salt mismatch after the run.
+    $refreshMergeStatus = {
+        $mergeListBox.Items.Clear()
+        if ($mergePathList.Count -eq 0) {
+            $mergeStatus.ForeColor = [System.Drawing.Color]::DimGray
+            $mergeStatus.Text = 'Nothing chosen yet. Add the merge-export.json from each site, or a folder to search for them.'
+            return
+        }
+
+        $imports = @()
+        foreach ($path in $mergePathList) { $imports += & $fnImportMergeExport -Path $path }
+        $set = & $fnTestMergeExportSet -Imports $imports
+
+        foreach ($i in $imports) {
+            if ($i.Error) {
+                [void] $mergeListBox.Items.Add(("!  {0}  --  unreadable" -f (Split-Path -Leaf $i.Path)))
+                continue
+            }
+            $label = [string] $i.Export.site.environmentLabel
+            $users = @($i.Export.users).Count
+            $print = [string] $i.Export.saltFingerprint
+            if ($print.Length -gt 8) { $print = $print.Substring(0, 8) }
+            [void] $mergeListBox.Items.Add(("{0}  --  {1} user(s)  --  key {2}" -f $label, $users, $print))
+        }
+
+        if ($set.Rejected.Count -gt 0) {
+            $mergeStatus.ForeColor = [System.Drawing.Color]::Firebrick
+            $mergeStatus.Text = [string] $set.Rejected[0].Reason
+            return
+        }
+
+        $parts = @("{0} export(s) from {1} site(s)" -f $set.Usable.Count, $set.SitesSeen)
+        if ($set.RepeatedSites -gt 0) {
+            $parts += "{0} site(s) exported more than once, which is how trends over time are built" -f $set.RepeatedSites
+        }
+        if ($set.CoverageGaps.Count -gt 0) {
+            $mergeStatus.ForeColor = [System.Drawing.Color]::DarkGoldenrod
+            $parts += "{0} gap(s) between windows: totals spanning a gap are a lower bound, not a count" -f $set.CoverageGaps.Count
+        } else {
+            $mergeStatus.ForeColor = [System.Drawing.Color]::ForestGreen
+        }
+        if (-not $set.Anonymized) { $parts += 'not anonymized: these carry raw identifiers' }
+        $mergeStatus.Text = ($parts -join '. ') + '.'
+    }.GetNewClosure()
+
+    $btnMergeFiles.Add_Click({
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Title = 'Choose merge exports to combine'
+        $dlg.Filter = 'Merge export (merge-export.json)|merge-export.json|JSON files (*.json)|*.json|All files (*.*)|*.*'
+        $dlg.Multiselect = $true
+        $dlg.CheckFileExists = $true
+        if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        foreach ($f in $dlg.FileNames) {
+            if (-not $mergePathList.Contains($f)) { [void] $mergePathList.Add($f) }
+        }
+        & $refreshMergeStatus
+    }.GetNewClosure())
+
+    $btnMergeFolder.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = 'Choose a folder to search for merge-export.json'
+        if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+        # The same search the run performs, so the list cannot promise
+        # something the run would not find.
+        $found = @(Get-ChildItem -LiteralPath $dlg.SelectedPath -Recurse -Filter 'merge-export.json' -ErrorAction SilentlyContinue)
+        if ($found.Count -eq 0) {
+            $mergeStatus.ForeColor = [System.Drawing.Color]::Firebrick
+            $mergeStatus.Text = "No merge-export.json under $($dlg.SelectedPath). It is produced by a run with 'Export this site for combining' ticked."
+            return
+        }
+        foreach ($f in $found) {
+            if (-not $mergePathList.Contains($f.FullName)) { [void] $mergePathList.Add($f.FullName) }
+        }
+        & $refreshMergeStatus
+    }.GetNewClosure())
+
+    $btnMergeRemove.Add_Click({
+        # Descending, so removing by index does not shift the ones still to go.
+        $idx = @($mergeListBox.SelectedIndices) | Sort-Object -Descending
+        foreach ($i in $idx) {
+            if ($i -ge 0 -and $i -lt $mergePathList.Count) { $mergePathList.RemoveAt($i) }
+        }
+        & $refreshMergeStatus
+    }.GetNewClosure())
+
+    & $refreshMergeStatus
+
+    # Defined here, not beside the environment combo where it is wired up:
+    # the always-shown rows reference the days, output and group controls,
+    # and a scriptblock written before those exist captures nulls. The
+    # arrays are built from live references, so this has to come last.
+    # Fields that cannot apply are HIDDEN, not merely greyed out, and
+    # everything below them moves up to close the gap. Disabling left a
+    # column of dead controls on screen -- seven of them for a cloud tenant --
+    # which made the form taller than the screen on a laptop and buried the
+    # action bar. Hiding keeps the dialog to what the operator can actually
+    # answer.
+    #
+    # Each row is (controls, height). Height is the row's own advance, so a
+    # row holding two controls side by side -- the hostname and its protocol,
+    # the output path and its Browse button -- counts once.
+    $onPremConnection = @(
+        @{ C = @($serverLabel);                 H = 22 }
+        @{ C = @($serverBox, $protocolBox);     H = 36 }
+    )
+    $cloudConnection = @(
+        @{ C = @($customerLabel);  H = 22 }
+        @{ C = @($customerBox);    H = 36 }
+        @{ C = @($clientIdLabel);  H = 22 }
+        @{ C = @($clientIdBox);    H = 36 }
+        @{ C = @($secretLabel);    H = 22 }
+        @{ C = @($secretBox);      H = 36 }
+        @{ C = @($cloudDocsLink);  H = 30 }
+    )
+    $onPremAuth = @(
+        @{ C = @($authLabel);           H = 22 }
+        @{ C = @($rbCurrentUser);       H = 24 }
+        @{ C = @($rbDifferentAccount);  H = 28 }
+    )
+    # Contacts nothing, so it replaces the connection rows entirely rather
+    # than sitting alongside them.
+    $consolidateRows = @(
+        @{ C = @($mergeLabel);    H = 22 }
+        @{ C = @($mergeListBox);  H = 90 }
+        @{ C = @($btnMergeFiles, $btnMergeFolder, $btnMergeRemove); H = 32 }
+        @{ C = @($mergeStatus);   H = 48 }
+        @{ C = @($cbUpnBridge);   H = 22 }
+        @{ C = @($lblUpnCaveat);  H = 56 }
+    )
+    $onPremAccount = @(
+        @{ C = @($acctUserLabel);  H = 22 }
+        @{ C = @($acctUserBox);    H = 36 }
+        @{ C = @($acctPassLabel);  H = 22 }
+        @{ C = @($acctPassBox);    H = 36 }
+    )
+    # Always shown, and always last. Repositioned rather than left where they
+    # were built, because what precedes them changes height.
+    $alwaysRows = @(
+        @{ C = @($daysLabel);        H = 22 }
+        @{ C = @($daysBox);          H = 36 }
+        @{ C = @($outLabel);         H = 22 }
+        @{ C = @($outBox, $browse);  H = 40 }
+        @{ C = @($group);            H = ($group.Height + 16) }
+    )
+
+    # Moves one row to an absolute Y, preserving each control's own vertical
+    # offset within the row -- Browse sits one pixel above its text box, and
+    # that relationship has to survive being moved.
+    $placeRow = {
+        param($Row, $Top)
+        $first = $Row.C[0]
+        $delta = $Top - $first.Top
+        foreach ($c in $Row.C) {
+            $c.Visible = $true
+            $c.Top = $c.Top + $delta
+        }
+    }.GetNewClosure()
+
+    $hideRows = {
+        param($Rows)
+        foreach ($r in $Rows) { foreach ($c in $r.C) { $c.Visible = $false } }
+    }.GetNewClosure()
+
+    $updateFields = {
+        # Three states now, not two. Consolidating is neither on-premises nor
+        # cloud: it contacts nothing, so every connection and credential row
+        # goes away and the export list takes their place.
+        $isConsolidate = $envBox.SelectedIndex -eq $consolidateIndex
+        $isCloud = (-not $isConsolidate) -and $envBox.SelectedIndex -gt 0
+        $useDifferentAccount = (-not $isConsolidate) -and (-not $isCloud) -and $rbDifferentAccount.Checked
+
+        # Suspended for the whole pass: without it every row assignment
+        # repaints, and the form visibly walks its controls down the screen.
+        $content.SuspendLayout()
+        try {
+            $yy = $variableTop
+
+            if ($isConsolidate) {
+                & $hideRows $onPremConnection
+                & $hideRows $onPremAuth
+                & $hideRows $onPremAccount
+                & $hideRows $cloudConnection
+                foreach ($r in $consolidateRows) { & $placeRow $r $yy; $yy += $r.H }
+            } elseif ($isCloud) {
+                & $hideRows $consolidateRows
+                & $hideRows $onPremConnection
+                & $hideRows $onPremAuth
+                & $hideRows $onPremAccount
+                foreach ($r in $cloudConnection) { & $placeRow $r $yy; $yy += $r.H }
+            } else {
+                & $hideRows $consolidateRows
+                & $hideRows $cloudConnection
+                foreach ($r in $onPremConnection) { & $placeRow $r $yy; $yy += $r.H }
+                foreach ($r in $onPremAuth) { & $placeRow $r $yy; $yy += $r.H }
+                if ($useDifferentAccount) {
+                    foreach ($r in $onPremAccount) { & $placeRow $r $yy; $yy += $r.H }
+                } else {
+                    # Hidden rather than disabled for the same reason as the
+                    # rest: four dead boxes are four rows of nothing.
+                    & $hideRows $onPremAccount
+                }
+            }
+
+            foreach ($r in $alwaysRows) { & $placeRow $r $yy; $yy += $r.H }
+
+            # The scrolling panel needs the real extent, or the action bar at
+            # the bottom is unreachable on the taller (on-premises) layout.
+            $content.AutoScrollMinSize = New-Object System.Drawing.Size(0, ($yy + 8))
+        } finally {
+            $content.ResumeLayout()
+        }
+    }.GetNewClosure()
+    $envBox.Add_SelectedIndexChanged($updateFields)
+    $rbCurrentUser.Add_CheckedChanged($updateFields)
+    $rbDifferentAccount.Add_CheckedChanged($updateFields)
+    & $updateFields
     $y += 26
 
     # $y now measures the full height the content panel needs to lay out
@@ -5458,7 +9181,10 @@ function Show-AuditGui {
     # screen even when the user shrinks the window; it also doubles as the
     # floor Get-CappedFormClientHeight won't shrink below.
     $minUsableContent = 220
-    $minimumClientHeight = $headerHeight + $minUsableContent + $actionBarHeight
+    # The strip is included here even though it starts at zero: the minimum
+    # must leave room for a message to appear without squeezing the content
+    # below anything usable.
+    $minimumClientHeight = $headerHeight + $minUsableContent + $statusStripHeight + $actionBarHeight
 
     $cappedClientHeight = Get-CappedFormClientHeight -DesiredClientHeight $actualClientHeight `
         -Chrome $chrome `
@@ -5473,7 +9199,7 @@ function Show-AuditGui {
         ($minimumClientHeight + $chrome))
 
     # Action bar: fixed, docked to the bottom of the form, outside the
-    # scrolling content panel, so Run audit / Close are visible regardless
+    # scrolling content panel, so Run Report / Close are visible regardless
     # of scroll position or window size. Positioned against actionBar's
     # actual (now-final) width rather than the $formWidth constant, so this
     # still lines up correctly even if the height cap above also changed
@@ -5498,7 +9224,340 @@ function Show-AuditGui {
 
     $actionBar.Controls.AddRange(@($run, $cancel))
 
-    $script:GuiResult = $null
+    # A hashtable rather than $script:GuiResult, because the handlers that
+    # write it are .GetNewClosure() scriptblocks. A closure is bound to a
+    # fresh module scope, and $script: inside a module means THAT module's
+    # scope -- so `$script:GuiResult = $cfg` from a handler landed where
+    # nothing could read it, Show-ReportGui returned $null forever, and every
+    # Run click reported "Canceled." with no other evidence, because the run
+    # log is not initialized until after the dialog returns.
+    #
+    # Mutating a hashtable the closure captured works regardless of scope:
+    # the closure holds the same reference, not a copy of the contents.
+    #
+    # ExitCode starts at 2. Show-ReportGui returns this number and a customer
+    # wrapper acts on it, so "the window was closed without a run ever
+    # finishing" has to be canceled, never success -- the same reasoning as
+    # the worker's own $exitCode default in src/93-RunHost.ps1.
+    $result = @{ Config = $null; ExitCode = 2 }
+
+    # Everything the run page's handlers read or write, in ONE hashtable, and
+    # the object this function returns. A hashtable rather than the
+    # pscustomobject this used to return for the same reason $result is one:
+    # the handlers below are closures, they capture this reference, and a
+    # caller (or a test) assigning $built.ConfirmClose mutates the very thing
+    # they read. A property assigned on a returned pscustomobject would land
+    # somewhere no closure could see -- which is the shape of the defect that
+    # made every Run click report "Canceled." for two releases.
+    #
+    # Controls is filled in at the bottom, once every control exists.
+    $built = @{
+        Form        = $form
+        Controls    = $null
+        Result      = $result
+        # The live run panel's controls, rebuilt for each run because its
+        # phase column is specific to what that configuration will do.
+        RunPanel    = $null
+        # The background runspace, or $null between runs.
+        Worker      = $null
+        Channel     = $null
+        Source      = $null
+        RunStart    = $null
+        # True once a Done event has been applied. Together with Channel this
+        # is what "a run is in flight" means to FormClosing: what the operator
+        # can SEE on the panel, rather than a handle state they cannot.
+        Finished    = $false
+        ReportPath  = $null
+        OutputPath  = $null
+        ConfirmClose = $null
+        # The scriptblock the background runspace runs, assigned just below.
+        # Injectable for the same reason Start-ReportWorker takes its work as
+        # a parameter rather than hardcoding it (see that function's own
+        # DESCRIPTION): the real work needs a Citrix site or a minute of demo
+        # generation, and some properties of the machinery around it can only
+        # be shown against work that behaves in a particular way.
+        #
+        # Specifically: closing the window over work parked in a
+        # NON-COOPERATIVE native call is the exact failure decision 4 exists
+        # to prevent, and it cannot be produced by the real work on demand.
+        # Without this seam the only coverage was a cooperative worker that
+        # had already finished, which a synchronous Stop-ReportWorker in
+        # FormClosing would have passed just as happily.
+        WorkBlock   = $null
+    }
+
+    # Injectable, and read through $built rather than by name, for two
+    # separate reasons. A MessageBox cannot be answered from a test, and this
+    # branch is the one that decides whether a five-hour run is abandoned --
+    # left uninjectable it would ship on inspection alone. And a closure's
+    # command lookup falls back to global, so calling a helper function by
+    # name from inside FormClosing is the exact failure that made
+    # New-InteractiveCredential unavailable to a customer for four releases.
+    $built.ConfirmClose = {
+        ([System.Windows.Forms.MessageBox]::Show(
+            'The report is still running. Cancel it and close?',
+            'Citrix Usage Report',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question) -eq
+         [System.Windows.Forms.DialogResult]::Yes)
+    }
+
+    # ---- the work the background runspace performs -------------------------
+    #
+    # DELIBERATELY NOT A CLOSURE, and it must never become one. This object
+    # is handed to Start-ReportWorker, which rebuilds it inside the runspace
+    # with [scriptblock]::Create($Work.ToString()) -- the only way to give it
+    # that runspace's session state instead of this one's. That reconstruction
+    # discards any closure silently: a captured variable would simply be
+    # $null there, with no error anywhere. So every value this needs arrives
+    # through $Channel, $Source or $Arguments, it names no $fn* capture, and
+    # the .GetNewClosure() calls inside it are built at run time, in the
+    # runspace, over that runspace's own $Channel.
+    $workBlock = {
+        param($Channel, $Source, $Arguments)
+
+        Set-ReportCancellation -Source $Source
+
+        # Registered before any work starts, so the panel's log pane sees the
+        # run from its first line. Write-ReportLog calls this only AFTER
+        # redaction, so the pane can never show more than the log file does.
+        Register-ReportLogSink -Sink {
+            param($Level, $Text)
+            $Channel.Enqueue(@{ Kind = 'Log'; Level = $Level; Text = $Text })
+        }.GetNewClosure()
+
+        $collect = {
+            param($Entity, $Count)
+            $Channel.Enqueue(@{ Kind = 'Count'; Text = ('{0}: {1:N0} records so far' -f $Entity, $Count) })
+        }.GetNewClosure()
+
+        $progress = {
+            param($Stage, $Percent)
+            $Channel.Enqueue(@{ Kind = 'Progress'; Status = $Stage; Percent = $Percent })
+        }.GetNewClosure()
+
+        $phase = {
+            param($Name, $State)
+            $Channel.Enqueue(@{ Kind = 'Phase'; Name = $Name; State = $State })
+            # A Count event, which puts the bar into Marquee and names the
+            # phase on the status line. Only Collect and Analyze ever report
+            # a real fraction; without this the bar sat at 0% and the status
+            # line stayed empty for the whole of Generate -- observed at 50+
+            # seconds on demo data alone, which reads as a stalled run
+            # rather than a working one.
+            #
+            # Filtered against the panel's own phase list, which arrives in
+            # $Arguments. Invoke-ReportRun announces Export unconditionally
+            # (see its comment there) and Update-RunPanel silently drops a
+            # Phase event it has no label for -- but a Count event is not
+            # dropped, it just writes to the status line. Unfiltered, a
+            # demo run with every export switched off flashed "Export..."
+            # and a marquee for a phase the flow beside it correctly never
+            # listed, which is the panel contradicting itself.
+            if ($State -eq 'Active' -and @($Arguments.Phases) -contains $Name) {
+                $Channel.Enqueue(@{ Kind = 'Count'; Text = ('{0}...' -f $Name) })
+            }
+        }.GetNewClosure()
+
+        # -NoLaunch because the panel's own "Open report" button is the GUI's
+        # affordance; a browser opening by itself on top of the window the
+        # operator is watching is not.
+        $r = Invoke-ReportRun -Config $Arguments.Config `
+            -ProgressAction $progress -CollectAction $collect -PhaseAction $phase -NoLaunch
+
+        return @{ ExitCode = $r.ExitCode; ReportPath = $r.ReportPath; RunDirectory = $r.RunDirectory }
+    }
+    # Published so the Run handler reads it through the captured hashtable,
+    # which is what makes it substitutable. Assigned here, after the
+    # declaration, because $workBlock does not exist until this line.
+    $built.WorkBlock = $workBlock
+
+    # The phases the CURRENT state of the form would run, so the page previews
+    # something true rather than a fixed list. MergePaths only counts in the
+    # combine environment -- everywhere else the list is ignored, and passing
+    # it would preview a consolidation that is not going to happen.
+    $previewPhases = {
+        $previewConfig = [pscustomobject]@{
+            MergePaths     = $(if ($envBox.SelectedIndex -eq $consolidateIndex) {
+                                  [string[]] $mergePathList.ToArray() } else { @() })
+            DemoData       = $cbDemo.Checked
+            ExportRawData  = $cbExport.Checked
+            ExportForMerge = $cbMerge.Checked
+            Anonymize      = $cbAnon.Checked
+        }
+        & $fnGetRunPhaseList -Config $previewConfig
+    }.GetNewClosure()
+
+    # 150ms: fast enough that the log feels live, slow enough that a run
+    # emitting thousands of lines is drained in batches rather than repainted
+    # once per line.
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 150
+    $timer.Add_Tick({
+        # A tick that throws would stop every later update and freeze the
+        # window mid-run with nothing said. Update-RunPanel already guards
+        # each individual event; this guards the drain itself.
+        try {
+            $channel = $built.Channel
+            if (-not $channel) { return }
+            $rp = $built.RunPanel
+            if (-not $rp) { return }
+
+            $events = & $fnReadRunEvents -Channel $channel
+
+            # Read before the panel consumes them: Update-RunPanel uses the
+            # Done event to decide which buttons to show but keeps none of
+            # its detail, and the report path is what "Open report" needs.
+            foreach ($e in $events) {
+                if ($e -and $e.Kind -eq 'Done') {
+                    $built.ReportPath = [string] $e.ReportPath
+                    $result.ExitCode = [int] $e.ExitCode
+                }
+            }
+
+            $finished = & $fnUpdateRunPanel -Controls $rp -Events $events
+
+            if ($finished) {
+                $timer.Stop()
+                $built.Finished = $true
+                # Update-RunPanel writes the final elapsed time from the
+                # Done event; the status line is this page's own summary of
+                # how the run ended, and nothing else would say it.
+                if ($result.ExitCode -eq 0) {
+                    $rp.StatusLabel.Text = 'Report complete.'
+                } elseif ($result.ExitCode -eq 2) {
+                    $rp.StatusLabel.Text = 'Run canceled. Anything part-written was removed.'
+                } else {
+                    $rp.StatusLabel.Text = 'The run did not complete. The activity log above says why.'
+                }
+            } elseif ($built.RunStart) {
+                # Counted here rather than in Update-RunPanel, which only
+                # learns the elapsed time from the Done event at the very end
+                # -- a clock that sits at 00:00:00 for five hours and then
+                # jumps is worse than no clock.
+                # d\.hh\:mm\:ss, not hh\:mm\:ss: the latter silently
+                # truncates at 24 hours (a 25-hour run would show 01:00:00)
+                # -- a displayed number that is wrong and looks right, which
+                # is exactly what this project exists to avoid.
+                $rp.ElapsedLabel.Text = 'Elapsed {0:d\.hh\:mm\:ss}' -f ([datetime]::UtcNow - $built.RunStart)
+            }
+        } catch { }
+    }.GetNewClosure())
+
+    # Builds a fresh run panel for $Phases and wires its four buttons. Called
+    # once at construction (so the page exists, hidden, before Run is ever
+    # clicked) and again for every run and every "Run another".
+    $prepareRunPanel = {
+        param($Phases)
+
+        # Local aliases, and they are load-bearing. GetNewClosure() copies
+        # only the variables in the IMMEDIATE local scope; a variable this
+        # scriptblock resolved from its OWN closure's scope is reachable
+        # here but is NOT copied into a closure created inside it. Nesting
+        # one closure in another therefore silently hands the inner one
+        # $null for every outer name -- verified directly, and it is the
+        # same family of defect as the three this file's header comment
+        # records. Aliasing them into locals first is what makes the four
+        # button handlers below able to see anything at all.
+        $state = $built
+        $page = $runHost
+        $configPage = $content
+        $configBar = $actionBar
+        $pollTimer = $timer
+        $stopAsync = $fnStopReportWorkerAsync
+        $phasesNow = $previewPhases
+
+        $runHost.SuspendLayout()
+        try {
+            foreach ($old in @($runHost.Controls)) {
+                $runHost.Controls.Remove($old)
+                $old.Dispose()
+            }
+
+            # The window's own client area, never a size of this panel's
+            # choosing: the run page swaps into whatever
+            # Get-CappedFormClientHeight already settled on, and reopening
+            # the sizing question here is how the buttons ended up off-screen
+            # the last time.
+            $panelWidth = [Math]::Max(200, $form.ClientSize.Width)
+            $panelHeight = [Math]::Max(200, $form.ClientSize.Height - $headerHeight)
+
+            $rp = & $fnNewRunPanelControls -Phases $Phases -Width $panelWidth -Height $panelHeight
+            $rp.Panel.Dock = 'Fill'
+            $runHost.Controls.Add($rp.Panel)
+            $built.RunPanel = $rp
+        } finally {
+            $runHost.ResumeLayout()
+        }
+
+        $rp.CancelButton.Add_Click({
+            try { if ($state.Source) { $state.Source.Cancel() } } catch { }
+            # Disabled rather than hidden: the operator needs to see that the
+            # press registered, and a second press must be inert -- cancelling
+            # is not instant, because it is only noticed at a phase boundary.
+            $b = $state.RunPanel.CancelButton
+            $b.Text = 'Canceling...'
+            $b.Enabled = $false
+        }.GetNewClosure())
+
+        $rp.OpenReportButton.Add_Click({
+            # A dead link is a nuisance; an unhandled exception out of a click
+            # handler is worse. Same reasoning as the documentation link above.
+            try { if ($state.ReportPath) { Start-Process $state.ReportPath } } catch { }
+        }.GetNewClosure())
+
+        $rp.OpenFolderButton.Add_Click({
+            try {
+                # The run directory, which only the report path names -- a
+                # canceled or failed run has no report, so the output folder
+                # the operator chose is the honest fallback rather than
+                # nothing happening at all.
+                $folder = $null
+                if ($state.ReportPath) { $folder = Split-Path -Parent $state.ReportPath }
+                if (-not $folder) { $folder = $state.OutputPath }
+                if ($folder) { Start-Process $folder }
+            } catch { }
+        }.GetNewClosure())
+
+        $rp.RunAnotherButton.Add_Click({
+            # This is the busiest of the four handlers -- it stops the timer,
+            # tears down the worker and rebuilds the panel via PrepareRunPanel,
+            # which disposes the very panel this button lives on -- and, until
+            # now, the only one of the four without a try/catch. An unhandled
+            # exception out of a click handler is worse than the error, same
+            # reasoning as the other three siblings above.
+            try {
+                $pollTimer.Stop()
+                # Async, not Stop-ReportWorker: by now the run has finished and
+                # the wait would normally be nothing, but "normally" is not a
+                # guarantee, and a frozen window is the one outcome this whole
+                # page exists to prevent.
+                & $stopAsync -Worker $state.Worker
+                $state.Worker = $null
+                $state.Channel = $null
+                $state.Source = $null
+                $state.RunStart = $null
+                $state.Finished = $false
+
+                $page.Visible = $false
+                $configPage.Visible = $true
+                $configBar.Visible = $true
+
+                # A brand-new panel, which is how the phase markers, the progress
+                # bar, the status line and the log are all reset at once -- there
+                # is no partially-cleared state left for the next run to inherit.
+                & $state.PrepareRunPanel (& $phasesNow)
+            } catch { }
+        }.GetNewClosure())
+    }.GetNewClosure()
+    # Published so the "Run another" handler above can reach it. It cannot
+    # simply name $prepareRunPanel: that variable does not exist yet at the
+    # moment the closure inside it is created.
+    $built.PrepareRunPanel = $prepareRunPanel
+
+    # Built now, hidden, so the page is part of the form from the start and
+    # the swap below is a visibility change rather than a construction.
+    & $prepareRunPanel (& $previewPhases)
 
     $run.Add_Click({
         try {
@@ -5509,27 +9568,47 @@ function Show-AuditGui {
 
             # Becomes a SecureString immediately, same as the cloud client
             # secret above, and is never written to disk or logged. $null
-            # here (the "signed-in user" radio) is what makes New-AuditConfig
+            # here (the "signed-in user" radio) is what makes New-ReportConfig
             # leave -Credential unset, so Get-AuthRequestParameters falls
             # back to -UseDefaultCredentials.
             $acctSecure = $null
             if ($acctPassBox.Text) {
                 $acctSecure = ConvertTo-SecureString -String $acctPassBox.Text -AsPlainText -Force
             }
-            $credential = New-InteractiveCredential -UseDifferentAccount $rbDifferentAccount.Checked `
+            $credential = & $fnNewInteractiveCredential -UseDifferentAccount $rbDifferentAccount.Checked `
                 -UserName $acctUserBox.Text -Password $acctSecure
 
             $selectedProtocol = if ($protocolBox.SelectedIndex -eq 1) { 'Http' } else { 'Https' }
 
-            $cfg = New-AuditConfig `
-                -Environment (Get-GuiEnvironmentName -Index $envBox.SelectedIndex) `
+            # Get-GuiEnvironmentName covers the four real environments only,
+            # and deliberately refuses an out-of-range index. Consolidating
+            # contacts nothing, so the value is unused -- but New-ReportConfig
+            # still wants a valid one, and inventing a fifth environment name
+            # to satisfy it would put a non-environment into the mapping that
+            # routes credentials to sovereign clouds.
+            $isConsolidateRun = $envBox.SelectedIndex -eq $consolidateIndex
+            $chosenEnvironment = if ($isConsolidateRun) {
+                'OnPremises'
+            } else {
+                & $fnGetGuiEnvironmentName -Index $envBox.SelectedIndex
+            }
+
+            # Caught here rather than by Test-ReportConfig, which returns
+            # early for a consolidation precisely because nothing is
+            # contacted -- so it has nothing to say about an empty list.
+            if ($isConsolidateRun -and $mergePathList.Count -eq 0) {
+                throw 'Add at least one merge export to combine. They are named merge-export.json and are produced by a run with "Export this site for combining" ticked.'
+            }
+
+            $cfg = & $fnNewReportConfig `
+                -Environment $chosenEnvironment `
                 -DeliveryController $serverBox.Text `
                 -Protocol $selectedProtocol `
                 -CustomerId $customerBox.Text `
                 -ClientId $clientIdBox.Text `
                 -ClientSecret $secure `
                 -Credential $credential `
-                -Days (ConvertTo-DaysArray -Text $daysBox.Text) `
+                -Days (& $fnConvertToDaysArray -Text $daysBox.Text) `
                 -OutputPath $outBox.Text `
                 -IncludeDeliveryGroups:$cbGroups.Checked `
                 -IncludeApplications:$cbApps.Checked `
@@ -5537,27 +9616,203 @@ function Show-AuditGui {
                 -IncludeTrend:$cbTrend.Checked `
                 -Anonymize:$cbAnon.Checked `
                 -ExportRawData:$cbExport.Checked `
+                -ExportForMerge:$cbMerge.Checked `
+                -SaltPath $txtSalt.Text `
+                -MergePaths ([string[]] $mergePathList.ToArray()) `
+                -UseUpnBridge:$cbUpnBridge.Checked `
                 -DemoData:$cbDemo.Checked
 
-            # Validate before closing, so a mistake is corrected here rather
-            # than surfacing as a stack trace after the window has gone.
-            Test-AuditConfig -Config $cfg
+            # Validate before starting, so a mistake is corrected here rather
+            # than surfacing as a stack trace from a background runspace.
+            # Everything below this line is committed: the page swaps and the
+            # worker starts, so nothing after it may throw for a reason the
+            # operator could have fixed on the configuration page.
+            & $fnTestReportConfig -Config $cfg
 
-            $script:GuiResult = $cfg
-            $form.Close()
+            $result.Config = $cfg
+            $result.ExitCode = 2
+            $built.OutputPath = [string] $cfg.OutputPath
+            $built.ReportPath = $null
+            $built.Finished = $false
+
+            # The real phase list for THIS configuration, replacing the
+            # preview built at construction. Held in a local as well, because
+            # the work block is given it -- see the status-line filter there.
+            $phases = & $fnGetRunPhaseList -Config $cfg
+            & $built.PrepareRunPanel $phases
+
+            # The swap. Clearing the status text also collapses the status
+            # strip (see its TextChanged handler), so a refusal from an
+            # earlier attempt does not sit under the run page.
+            $status.Text = ''
+            $content.Visible = $false
+            $actionBar.Visible = $false
+            $runHost.Visible = $true
+
+            $built.Channel = & $fnNewRunChannel
+            $built.Source = New-Object System.Threading.CancellationTokenSource
+            $built.RunStart = [datetime]::UtcNow
+
+            # Start-ReportWorker never throws -- a construction failure comes
+            # back as an already-torn-down worker with Done already published
+            # -- so the timer below always has something to drain.
+            $built.Worker = & $fnStartReportWorker `
+                -Channel $built.Channel `
+                -Source $built.Source `
+                -Work $built.WorkBlock `
+                -BootstrapPath (& $fnGetReportBootstrapPath) `
+                -Arguments @{ Config = $cfg; Phases = [string[]] $phases }
+
+            $timer.Start()
         } catch {
             $status.ForeColor = [System.Drawing.Color]::Firebrick
             $status.Text = $_.Exception.Message
         }
-    })
+    }.GetNewClosure())
 
-    $cancel.Add_Click({ $script:GuiResult = $null; $form.Close() })
+    # Closing mid-run has to be a question, not an accident: at 2,000,000
+    # sessions this is five hours of work, and the window's X is one click
+    # away from the Cancel button.
+    $form.Add_FormClosing({
+        param($closingSender, $closingArgs)
 
-    [void] $form.ShowDialog()
-    return $script:GuiResult
+        # "In flight" is what the operator can see on the page -- the run
+        # page is up and no Done has been applied yet -- rather than the
+        # worker handle's state, which can complete a moment before the
+        # timer's next tick has had a chance to say so.
+        $inFlight = ($built.Channel -and -not $built.Finished)
+        if ($inFlight) {
+            $proceed = $true
+            if ($built.ConfirmClose) { $proceed = [bool] (& $built.ConfirmClose) }
+            if (-not $proceed) {
+                $closingArgs.Cancel = $true
+                return
+            }
+        }
+
+        try { $timer.Stop() } catch { }
+        try { if ($built.Source) { $built.Source.Cancel() } } catch { }
+        # Stop-ReportWorkerAsync, NEVER Stop-ReportWorker. The synchronous
+        # one blocks the calling thread for as long as the work is parked in
+        # a non-cooperative native call -- measured at ~29s against a
+        # blocking pipeline. Called from here that is the message pump
+        # frozen and an unclosable window, which is the exact failure this
+        # whole page exists to prevent. See both functions' doc comments in
+        # src/93-RunHost.ps1.
+        & $fnStopReportWorkerAsync -Worker $built.Worker
+        $built.Worker = $null
+        $built.Channel = $null
+    }.GetNewClosure())
+
+    $cancel.Add_Click({ $result.Config = $null; $form.Close() }.GetNewClosure())
+
+
+    # Named handles for the caller and for the geometry tests. Only controls
+    # whose position or visibility is part of the contract are listed.
+    $controls = @{
+        Form           = $form
+        Content        = $content
+        EnvBox         = $envBox
+        ServerLabel    = $serverLabel
+        ServerBox      = $serverBox
+        ProtocolBox    = $protocolBox
+        CustomerLabel  = $customerLabel
+        CustomerBox    = $customerBox
+        ClientIdLabel  = $clientIdLabel
+        ClientIdBox    = $clientIdBox
+        SecretLabel    = $secretLabel
+        SecretBox      = $secretBox
+        CloudDocsLink  = $cloudDocsLink
+        AuthLabel      = $authLabel
+        RbCurrentUser  = $rbCurrentUser
+        RbDifferent    = $rbDifferentAccount
+        AcctUserLabel  = $acctUserLabel
+        AcctUserBox    = $acctUserBox
+        AcctPassLabel  = $acctPassLabel
+        AcctPassBox    = $acctPassBox
+        DaysLabel      = $daysLabel
+        DaysBox        = $daysBox
+        OutLabel       = $outLabel
+        OutBox         = $outBox
+        Browse         = $browse
+        Group          = $group
+        CbAnon         = $cbAnon
+        CbMerge        = $cbMerge
+        SaltLabel      = $lblSalt
+        SaltBox        = $txtSalt
+        SaltBrowse     = $btnSalt
+        SaltCreate     = $btnSaltNew
+        SaltStatus     = $lblSaltStatus
+        RefreshSalt    = $refreshSaltStatus
+        CbDemo         = $cbDemo
+        CbGroups       = $cbGroups
+        CbApps         = $cbApps
+        CbDevices      = $cbDevices
+        CbTrend        = $cbTrend
+        CbExport       = $cbExport
+        MergeLabel     = $mergeLabel
+        MergeList      = $mergeListBox
+        MergeAddFiles  = $btnMergeFiles
+        MergeAddFolder = $btnMergeFolder
+        MergeRemove    = $btnMergeRemove
+        MergeStatus    = $mergeStatus
+        MergePaths     = $mergePathList
+        RefreshMerge   = $refreshMergeStatus
+        CbUpnBridge    = $cbUpnBridge
+        UpnCaveat      = $lblUpnCaveat
+        ConsolidateIdx = $consolidateIndex
+        Run            = $run
+        Close          = $cancel
+        Status         = $status
+        StatusStrip    = $statusStrip
+        UpdateFields   = $updateFields
+        ActionBar      = $actionBar
+        RunHost        = $runHost
+        Timer          = $timer
+    }
+
+    $built.Controls = $controls
+    return $built
 }
 
-function Read-AuditConfigFromConsole {
+function Show-ReportGui {
+    <#
+    .SYNOPSIS
+        Shows the dialog, runs the report inside it, and returns the run's
+        exit code.
+    .DESCRIPTION
+        This used to hand a configuration back for the caller to run, which
+        is why the window had to close first. It does not any more: the run
+        happens on the run page, inside this same window, and by the time
+        ShowDialog returns the run is over.
+
+        The exit code is therefore this function's whole output, and it is a
+        real contract -- customers invoke the script from wrappers that act
+        on it, and it used to come from Invoke-ReportRun, which nothing calls
+        on this path now.
+    .OUTPUTS
+        int: 0 the run succeeded, 1 it failed, 2 it was canceled or the
+        window was closed without a run ever finishing.
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([string] $DefaultOutputPath)
+
+    $built = New-ReportGuiForm -DefaultOutputPath $DefaultOutputPath
+    try {
+        [void] $built.Form.ShowDialog()
+        # Seeded to 2 when the form was built and only ever overwritten from
+        # a Done event, so "closed without running" cannot read as success.
+        return [int] $built.Result.ExitCode
+    } finally {
+        # ShowDialog does not dispose the form, and this one now owns a
+        # timer and possibly a runspace.
+        try { $built.Controls.Timer.Dispose() } catch { }
+        try { $built.Form.Dispose() } catch { }
+    }
+}
+
+function Read-ReportConfigFromConsole {
     <#
     .SYNOPSIS
         Guided console prompts, for hosts without WinForms.
@@ -5641,22 +9896,943 @@ function Read-AuditConfigFromConsole {
     $outPath  = Read-Host "  Output folder [$DefaultOutputPath]"
     if (-not $outPath) { $outPath = $DefaultOutputPath }
 
-    $cfg = New-AuditConfig -Environment $environment -DeliveryController $server -Protocol $protocol `
+    # Asked before the config is built so the two answers can be reconciled:
+    # a merge export without anonymization carries raw identifiers, and the
+    # shared key file only has a purpose when pseudonyms need to be stable
+    # across sites. Choosing the export therefore chooses anonymization too,
+    # rather than failing later on a combination the operator did not know
+    # was invalid.
+    $anonymize = Confirm-Toggle 'Anonymize usernames?' $false
+    $mergeExport = Confirm-Toggle 'Also export data for combining with other sites?' $false
+    $saltPath = ''
+    if ($mergeExport) {
+        if (-not $anonymize) {
+            Write-Host '  Combining sites requires anonymization, so it has been turned on.' -ForegroundColor Yellow
+        }
+        Write-Host '  A shared key file makes the same person resolve to the same pseudonym at every site.' -ForegroundColor Cyan
+        Write-Host '  KEEP IT, and use the SAME file for every site you intend to combine.' -ForegroundColor Cyan
+        $saltPath = Read-Host '  Shared key file [alongside the report]'
+    }
+
+    $cfg = New-ReportConfig -Environment $environment -DeliveryController $server -Protocol $protocol `
         -CustomerId $customerId -ClientId $clientId -ClientSecret $secret -Credential $credential `
         -Days (ConvertTo-DaysArray -Text $daysText) -OutputPath $outPath `
         -IncludeDeliveryGroups:(Confirm-Toggle 'Delivery group breakdown?' $true) `
         -IncludeApplications:(Confirm-Toggle 'Published application breakdown (slower)?' $false) `
         -IncludeClientDevices:(Confirm-Toggle 'Client device breakdown (slower)?' $false) `
         -IncludeTrend:(Confirm-Toggle 'Daily activity trend?' $true) `
-        -Anonymize:(Confirm-Toggle 'Anonymize usernames?' $false) `
+        -Anonymize:($anonymize -or $mergeExport) `
         -ExportRawData:(Confirm-Toggle 'Export raw data?' $true) `
+        -ExportForMerge:$mergeExport `
+        -SaltPath $saltPath `
         -DemoData:(Confirm-Toggle 'Demo mode (synthetic data, no Citrix environment contacted)?' $false)
 
-    Test-AuditConfig -Config $cfg
+    Test-ReportConfig -Config $cfg
     return $cfg
 }
 
 # endregion 90-Gui.ps1
+
+# ----------------------------------------------------------------------------
+# region 92-RunPanel.ps1
+# ----------------------------------------------------------------------------
+# ============================================================================
+#  Live run panel
+#
+#  Today, clicking Run closes the configuration dialog and the work happens
+#  in a console window behind it -- at 2,000,000 sessions that is five hours
+#  with nothing on screen. This is the panel that replaces that: a top-down
+#  list of run phases, a progress bar, status/elapsed labels, a scrolling
+#  activity log, and the buttons.
+#
+#  Pure WinForms construction, built the exact way New-ReportGuiForm
+#  (src/90-Gui.ps1) is: a plain function that returns a hashtable of
+#  controls without ever calling Show or ShowDialog, so it can be inspected
+#  and driven from a test without a message loop. No threading, no
+#  runspace, no event handling lives here -- a later task applies run
+#  events to the controls this one builds.
+# ============================================================================
+
+# Markers rather than colour alone, so the state is legible without relying
+# on the operator distinguishing two greys.
+$script:RunPhaseMarkers = @{
+    Pending   = '   '
+    Active    = ' > '
+    Done      = ' * '
+    Failed    = ' X '
+    Cancelled = ' - '
+}
+
+# The pane is a tail of the run, not the record of it. The record is
+# usage-report.log on disk, which is complete and is what gets sent in.
+$script:MaxLogLines = 500
+
+function New-RunPanelControls {
+    <#
+    .SYNOPSIS
+        Builds the live run panel without showing it.
+    .DESCRIPTION
+        Separated construction from presentation for the same reason
+        New-ReportGuiForm is: a modal loop cannot be driven from a test, and
+        a layout defect here would otherwise only be caught by a person
+        watching a five-hour run.
+
+        The panel docks Fill so it can swap into the same window the
+        configuration dialog used (Task 11 wires that swap up) -- which is
+        also why nothing here assumes a minimum height beyond what
+        Get-CappedFormClientHeight already guarantees the caller. Docked
+        regions shrink and grow with whatever client area they are given;
+        nothing is pinned to an absolute screen position.
+    .OUTPUTS
+        hashtable: Panel, PhaseLabels (name -> Label), Bar, StatusLabel,
+        ElapsedLabel, LogBox, CancelButton, OpenReportButton,
+        OpenFolderButton, RunAnotherButton, LogLines.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)][string[]] $Phases,
+        [Parameter(Mandatory)][int] $Width,
+        [Parameter(Mandatory)][int] $Height
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    # Get-GuiPalette (src/90-Gui.ps1) is the shared source for both colours
+    # -- see that function's own comment for why this isn't a duplicated hex
+    # literal or a $script: variable reached across files.
+    $palette = Get-GuiPalette
+    $cobalt = $palette['Cobalt50']
+    $canvas = $palette['Canvas20']
+
+    $bodyFont = New-Object System.Drawing.Font('Public Sans', 9)
+    # Monospaced so the three-character state marker lines up the same way
+    # in front of every phase name, rather than drifting with each name's
+    # own width in a proportional font.
+    $phaseFont = New-Object System.Drawing.Font('Consolas', 10)
+    $logFont   = New-Object System.Drawing.Font('Consolas', 9)
+
+    $panel = New-Object System.Windows.Forms.Panel
+    $panel.Dock = 'Fill'
+    $panel.BackColor = $canvas
+    $panel.Font = $bodyFont
+    $panel.Size = New-Object System.Drawing.Size($Width, $Height)
+
+    # ---- log box, docked Bottom, with a splitter above it ------------------
+    # ~180px, matching the brief's mock, but never more than about a third
+    # of a short window. Measured on a 404px client height (the floor
+    # Get-CappedFormClientHeight will not shrink below, which a laptop or an
+    # RDP session really does reach): a fixed 180 left the phase column 94px
+    # for four phases needing 120, so the last one was clipped off the
+    # bottom -- the run page's own version of the buttons-off-screen defect
+    # New-ReportGuiForm was rewritten to fix. The splitter above it still
+    # lets the operator take the room back by hand.
+    # Multiline/ReadOnly/ScrollBars is the whole contract
+    # Add-RunPanelLogLine relies on; nothing here writes to it directly.
+    $logBoxHeight = [Math]::Max(80, [Math]::Min(180, [int] ($Height * 0.35)))
+    $logBox = New-Object System.Windows.Forms.TextBox
+    $logBox.Multiline = $true
+    $logBox.ReadOnly = $true
+    $logBox.ScrollBars = 'Vertical'
+    $logBox.Dock = 'Bottom'
+    $logBox.Height = $logBoxHeight
+    $logBox.Font = $logFont
+    $logBox.BackColor = [System.Drawing.Color]::White
+
+    $splitter = New-Object System.Windows.Forms.Splitter
+    $splitter.Dock = 'Bottom'
+    $splitter.Height = 4
+    $splitter.BackColor = $canvas
+
+    # ---- action bar, docked Bottom --------------------------------------
+    # Cancel and the three finished-state buttons share the bar's
+    # bottom-right corner. Cancel and Run Another occupy the SAME rightmost
+    # slot -- the two are mutually exclusive by construction (a run cannot
+    # be both in flight and finished), so nothing ever has to remember to
+    # hide one before showing the other's neighbour. Open Report and Open
+    # Folder sit to the left of Run Another, visible only alongside it.
+    $actionBarHeight = 48
+    $actionBar = New-Object System.Windows.Forms.Panel
+    $actionBar.Dock = 'Bottom'
+    $actionBar.Height = $actionBarHeight
+    $actionBar.BackColor = $canvas
+    # Given its real width BEFORE any Anchor'd child is added to it, and this
+    # is not cosmetic. A control's Anchor distance to its parent's right edge
+    # is captured against the parent's size at the moment the control is
+    # added -- and a freshly-created Panel is WinForms' own default 200px
+    # wide, not $Width, however it is docked afterwards. Every button below
+    # is positioned against $Width and anchored Top,Right, so against a
+    # 200px baseline each one banks a negative right-margin and then lands
+    # hundreds of pixels past the bar's right edge the first time the panel
+    # is really laid out. Measured before this line existed: Cancel's right
+    # edge at 1064 in a 644px-wide bar, i.e. entirely off screen. This is
+    # the same trap New-ReportGuiForm documents at its own $form.ClientSize
+    # line, and it went unnoticed here because nothing docked this panel
+    # into a real window until the run page was wired up.
+    $actionBar.Width = $Width
+
+    $btnWidth = 130
+    $btnHeight = 30
+    $btnTop = 9
+    $btnGap = 8
+    $btnRightMargin = 24
+
+    function New-RunPanelButton {
+        param([string] $Text, [int] $SlotFromRight, [bool] $Initial)
+
+        $x = $Width - $btnRightMargin - (($SlotFromRight + 1) * $btnWidth) - ($SlotFromRight * $btnGap)
+        $b = New-Object System.Windows.Forms.Button
+        $b.Text = $Text
+        $b.Size = New-Object System.Drawing.Size($btnWidth, $btnHeight)
+        $b.Location = New-Object System.Drawing.Point($x, $btnTop)
+        $b.Anchor = 'Top, Right'
+        $b.FlatStyle = 'Flat'
+        $b.Visible = $Initial
+        return $b
+    }
+
+    $cancelButton = New-RunPanelButton -Text 'Cancel' -SlotFromRight 0 -Initial $true
+    $cancelButton.BackColor = $cobalt
+    $cancelButton.ForeColor = [System.Drawing.Color]::White
+    $cancelButton.FlatAppearance.BorderSize = 0
+
+    # Hidden until the run ends -- see the SYNOPSIS note above on why Run
+    # Another shares Cancel's slot.
+    $runAnotherButton = New-RunPanelButton -Text 'Run another' -SlotFromRight 0 -Initial $false
+    $openFolderButton = New-RunPanelButton -Text 'Open folder' -SlotFromRight 1 -Initial $false
+    $openReportButton = New-RunPanelButton -Text 'Open report' -SlotFromRight 2 -Initial $false
+
+    # Match the Cancel button's borderless style
+    $runAnotherButton.FlatAppearance.BorderSize = 0
+    $openFolderButton.FlatAppearance.BorderSize = 0
+    $openReportButton.FlatAppearance.BorderSize = 0
+
+    $actionBar.Controls.AddRange(@($cancelButton, $runAnotherButton, $openFolderButton, $openReportButton))
+
+    # ---- content: left phase column + right status/progress area ----------
+    $phaseColumnWidth = 200
+
+    $content = New-Object System.Windows.Forms.Panel
+    $content.Dock = 'Fill'
+    $content.BackColor = $canvas
+    # Sized while it is still parentless, for the same anchoring reason as
+    # the action bar above and for one more: setting Width on a control that
+    # is ALREADY docked does nothing, because the dock layout immediately
+    # reasserts its own bounds. $rightArea below is Dock=Fill inside this
+    # panel with a Dock=Left sibling, so if this panel is still at WinForms'
+    # 200px default when the two are added, $rightArea ends up 0px wide --
+    # and the progress bar, anchored Top,Left,Right against a zero-width
+    # parent, banks a right-margin of -428 and comes out 856px wide in a
+    # 444px area. Measured exactly that before this line existed.
+    $content.Size = New-Object System.Drawing.Size(
+        $Width, [Math]::Max(80, ($Height - $logBoxHeight - $splitter.Height - $actionBarHeight)))
+
+    $rightArea = New-Object System.Windows.Forms.Panel
+    $rightArea.Dock = 'Fill'
+    $rightArea.BackColor = $canvas
+
+    $leftColumn = New-Object System.Windows.Forms.Panel
+    $leftColumn.Dock = 'Left'
+    $leftColumn.Width = $phaseColumnWidth
+    $leftColumn.BackColor = $canvas
+    # A long consolidation has five phases and the window can be dragged
+    # shorter than they fit. Scrolled rather than clipped: a phase the
+    # operator cannot see looks exactly like a phase that is not going to
+    # happen, which is the one thing this column exists to answer.
+    $leftColumn.AutoScroll = $true
+
+    # Fill first, then Left -- the same docking-order rule New-ReportGuiForm
+    # documents and relies on: this WinForms runtime only resolves the
+    # overlap correctly when the Fill-docked sibling is added to its parent
+    # before the Left-docked one.
+    $content.Controls.Add($rightArea)
+    $content.Controls.Add($leftColumn)
+
+    # One label per phase, stacked top-down in the exact order the run will
+    # execute them -- the caller passes Get-RunPhaseList's own order
+    # (src/15-RunChannel.ps1), so the pending column previews the whole run
+    # before a single phase starts.
+    $phaseLabels = @{}
+    $phaseTop = 16
+    $phaseLineHeight = 26
+    foreach ($name in $Phases) {
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = '{0}{1}' -f $script:RunPhaseMarkers.Pending, $name
+        $lbl.Location = New-Object System.Drawing.Point(12, $phaseTop)
+        $lbl.AutoSize = $true
+        $lbl.Font = $phaseFont
+        $leftColumn.Controls.Add($lbl)
+        $phaseLabels[$name] = $lbl
+        $phaseTop += $phaseLineHeight
+    }
+
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.Text = ''
+    $statusLabel.Location = New-Object System.Drawing.Point(16, 16)
+    $statusLabel.AutoSize = $true
+    $rightArea.Controls.Add($statusLabel)
+
+    $elapsedLabel = New-Object System.Windows.Forms.Label
+    $elapsedLabel.Text = '00:00:00'
+    $elapsedLabel.Location = New-Object System.Drawing.Point(16, 40)
+    $elapsedLabel.AutoSize = $true
+    $rightArea.Controls.Add($elapsedLabel)
+
+    # Sits under the status/elapsed pair, full width of the right area.
+    # Anchored rather than docked so it keeps its own fixed top position
+    # while the right area's actual width tracks the panel's -- Task 11's
+    # swap into the config dialog's window can resize this without the bar
+    # ever clipping or leaving a gap at the edge.
+    $bar = New-Object System.Windows.Forms.ProgressBar
+    $bar.Location = New-Object System.Drawing.Point(16, 68)
+    $bar.Size = New-Object System.Drawing.Size(($Width - $phaseColumnWidth - 32), 22)
+    $bar.Anchor = 'Top, Left, Right'
+    # Continuous is the sane state before any phase is active. The later
+    # task that applies run events switches this per active phase: Marquee
+    # only for one with no denominator to count against (Collect, which
+    # streams OData pages of unknown total up front), Continuous for every
+    # phase that can report a real fraction.
+    $bar.Style = 'Continuous'
+    $rightArea.Controls.Add($bar)
+
+    # Fill first, then the Bottom siblings, added so the LAST one added ends
+    # up hugging the true bottom edge (see New-ReportGuiForm's note on
+    # reverse z-order docking): actionBar must be outermost, the splitter
+    # sits directly above the log box it resizes, and the log box sits
+    # above that, leaving content to fill whatever remains at the top.
+    $panel.Controls.Add($content)
+    $panel.Controls.Add($splitter)
+    $panel.Controls.Add($logBox)
+    $panel.Controls.Add($actionBar)
+
+    $logLines = New-Object 'System.Collections.Generic.List[string]'
+
+    return @{
+        Panel            = $panel
+        PhaseLabels      = $phaseLabels
+        Bar              = $bar
+        StatusLabel      = $statusLabel
+        ElapsedLabel     = $elapsedLabel
+        LogBox           = $logBox
+        CancelButton     = $cancelButton
+        OpenReportButton = $openReportButton
+        OpenFolderButton = $openFolderButton
+        RunAnotherButton = $runAnotherButton
+        LogLines         = $logLines
+    }
+}
+
+function Add-RunPanelLogLine {
+    <#
+    .SYNOPSIS
+        Appends one line to the run panel's tail log, capped at MaxLogLines.
+    .DESCRIPTION
+        The pane is a tail, not the record -- see $script:MaxLogLines above.
+        Trims from the front once the cap is exceeded, so what remains is
+        always the most recent activity, then rewrites the box's Lines from
+        the trimmed list and scrolls to the end.
+
+        Lines is reassigned from LogLines.ToArray() rather than appended to
+        directly: @() around a generic List throws "Argument types do not
+        match" in Windows PowerShell 5.1, and TextBox.Lines wants a
+        string[] regardless, so ToArray() is both the safe and the required
+        conversion here.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable] $Controls,
+        [Parameter(Mandatory)][string] $Level,
+        [Parameter(Mandatory)][string] $Text
+    )
+
+    $line = '[{0}] {1}' -f $Level.ToUpperInvariant(), $Text
+    $Controls.LogLines.Add($line)
+
+    while ($Controls.LogLines.Count -gt $script:MaxLogLines) {
+        $Controls.LogLines.RemoveAt(0)
+    }
+
+    $Controls.LogBox.Lines = $Controls.LogLines.ToArray()
+    $Controls.LogBox.SelectionStart = $Controls.LogBox.TextLength
+    $Controls.LogBox.ScrollToCaret()
+}
+
+function Update-RunPanel {
+    <#
+    .SYNOPSIS
+        Applies a batch of run events to the panel's controls.
+    .DESCRIPTION
+        Separate from the timer that fetches them, so the whole of the UI's
+        behaviour can be tested by handing it an array -- no runspace, no
+        message loop, no Citrix data.
+    .OUTPUTS
+        True once a Done event has been applied, which is the caller's signal
+        to stop the timer.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)][hashtable] $Controls,
+        [AllowEmptyCollection()][object[]] $Events
+    )
+
+    $finished = $false
+
+    foreach ($e in $Events) {
+        # An unknown or malformed event is skipped, never fatal: this runs
+        # inside a timer tick, and an exception here would kill every later
+        # update and leave the window frozen mid-run with no explanation.
+        try {
+            if (-not $e -or -not $e.Kind) { continue }
+
+            switch ($e.Kind) {
+                'Phase' {
+                    if ($Controls.PhaseLabels.ContainsKey($e.Name)) {
+                        $marker = $script:RunPhaseMarkers[$e.State]
+                        if (-not $marker) { $marker = $script:RunPhaseMarkers['Pending'] }
+                        $Controls.PhaseLabels[$e.Name].Text = $marker + $e.Name
+                    }
+                }
+                'Progress' {
+                    $Controls.Bar.Style = 'Continuous'
+                    $Controls.Bar.Value = [Math]::Max(0, [Math]::Min(100, [int] $e.Percent))
+                    $Controls.StatusLabel.Text = [string] $e.Status
+                }
+                'Count' {
+                    # No denominator for this phase, so motion plus an honest
+                    # number rather than a percentage we cannot back.
+                    $Controls.Bar.Style = 'Marquee'
+                    $Controls.StatusLabel.Text = [string] $e.Text
+                }
+                'Log' {
+                    Add-RunPanelLogLine -Controls $Controls -Level ([string] $e.Level) -Text ([string] $e.Text)
+                }
+                'Done' {
+                    $finished = $true
+                    $Controls.Bar.Style = 'Continuous'
+                    $Controls.Bar.Value = 100
+                    $Controls.CancelButton.Visible = $false
+                    $Controls.RunAnotherButton.Visible = $true
+                    $Controls.OpenFolderButton.Visible = $true
+                    # Only offer the report when one was actually finished.
+                    # A canceled or failed run deletes its partial output, so
+                    # the button would open nothing.
+                    $Controls.OpenReportButton.Visible =
+                        ($e.ExitCode -eq 0 -and $e.ReportPath -and (Test-Path $e.ReportPath))
+                    # d\.hh\:mm\:ss, not hh\:mm\:ss: the latter silently
+                    # truncates at 24 hours (a 25-hour run would show
+                    # 01:00:00) -- a displayed number that is wrong and looks
+                    # right, which is exactly what this project exists to avoid.
+                    $Controls.ElapsedLabel.Text = 'Elapsed {0:d\.hh\:mm\:ss}' -f $e.Elapsed
+                }
+            }
+        } catch {
+            # Swallowed on purpose; see above.
+        }
+    }
+
+    return $finished
+}
+
+# endregion 92-RunPanel.ps1
+
+# ----------------------------------------------------------------------------
+# region 93-RunHost.ps1
+# ----------------------------------------------------------------------------
+# ============================================================================
+#  Run host
+#
+#  Owns the background runspace the report runs in. The dialog stays open and
+#  repainting because none of the work happens on the UI thread.
+# ============================================================================
+
+function Get-ReportBootstrapPath {
+    <#
+    .SYNOPSIS
+        The ordered list of files a worker runspace must dot-source to have
+        this script's functions available to it.
+    .DESCRIPTION
+        A runspace is a fresh session state holding none of our functions, so
+        the worker rebuilds them by dot-sourcing the script it came from. What
+        "the script it came from" means differs between the two layouts this
+        repository ships in, and getting it wrong is silent: the worker would
+        start, find no Invoke-ReportRun, and report a failed run.
+
+          * Built: dist/CitrixUsageReport.ps1 is every source concatenated
+            into one file, so that single path is the whole bootstrap.
+
+          * Sources: $PSCommandPath -- captured as $script:ReportScriptPath in
+            src/00-Header.ps1 -- is only 00-Header.ps1, which declares the
+            param block and the version stamp and defines not one function.
+            The bootstrap is therefore the whole src/NN-*.ps1 set, in the same
+            numeric order build.ps1 concatenates them in.
+
+        The layout is detected from the file itself rather than from a flag,
+        because nothing in the process knows which way it was started: the
+        running file's own name carries a NN- prefix AND its directory holds
+        other NN-*.ps1 files. Both halves are needed -- a customer who renamed
+        the built script to 01-Report.ps1 satisfies the first on its own, and
+        would then get a bootstrap listing only itself, which is correct.
+    .OUTPUTS
+        string[]: one path for a built script, or the ordered source list.
+        Empty when the script path is unknown (the test suite dot-sources
+        individual files, so nothing was ever captured).
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([AllowNull()][string] $ScriptPath = $script:ReportScriptPath)
+
+    if ([string]::IsNullOrWhiteSpace($ScriptPath)) { return [string[]] @() }
+
+    $leaf = Split-Path -Leaf $ScriptPath
+    $dir = Split-Path -Parent $ScriptPath
+
+    if ($leaf -match '^\d\d-' -and $dir) {
+        $siblings = @(Get-ChildItem -LiteralPath $dir -Filter '*.ps1' -File -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -match '^\d\d-' } |
+                      Sort-Object Name)
+        if ($siblings.Count -gt 1) {
+            return [string[]] @($siblings | ForEach-Object { $_.FullName })
+        }
+    }
+
+    return [string[]] @($ScriptPath)
+}
+
+function Start-ReportWorker {
+    <#
+    .SYNOPSIS
+        Starts the report work in a background runspace.
+    .DESCRIPTION
+        The work is injected rather than hardcoded, so the concurrency
+        machinery can be tested with a trivial scriptblock and no Citrix data.
+
+        The work is called as & $Work $Channel $Source $Arguments and returns
+        a hashtable with at least ExitCode, and ReportPath when it produced
+        one.
+
+        Never throws. Construction (opening the runspace, wiring up the
+        pipeline, starting it) can fail before any background thread exists to
+        report anything -- in which case nothing would ever enqueue a Done
+        event, and a caller polling the channel would wait forever for one
+        that can never arrive. That is the same hung-panel failure as a
+        bootstrap failure inside the runspace, just one layer further out, so
+        it gets the same treatment: publish Done directly here and hand back a
+        worker that is already fully torn down, rather than throw.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)] $Channel,
+        [Parameter(Mandatory)][System.Threading.CancellationTokenSource] $Source,
+        [Parameter(Mandatory)][scriptblock] $Work,
+        # A LIST, dot-sourced in order, because running from src/ needs the
+        # whole src/NN-*.ps1 set and not just one file -- see
+        # Get-ReportBootstrapPath above, which is what callers should use to
+        # produce it. A single string still binds (PowerShell wraps it), so
+        # the one-file built case reads exactly as it did before.
+        [string[]] $BootstrapPath,
+        [hashtable] $Arguments = @{}
+    )
+
+    $runspace = $null
+    $shell = $null
+
+    try {
+        $runspace = [runspacefactory]::CreateRunspace()
+        # Must be set before Open() -- ApartmentState is read-only once the
+        # runspace has opened, and WinForms interop later in the pipeline (the
+        # dialog itself, and some COM-backed Citrix cmdlets) requires STA.
+        $runspace.ApartmentState = 'STA'
+        $runspace.ThreadOptions = 'ReuseThread'
+        $runspace.Open()
+
+        $shell = [powershell]::Create()
+        $shell.Runspace = $runspace
+
+        # Everything below runs in the new runspace. Note what it may NOT
+        # assume: not one function from this script exists there until the
+        # bootstrap has run. That is why the failure paths enqueue onto
+        # $Channel directly instead of calling Publish-RunEvent -- if the
+        # bootstrap is what failed, Publish-RunEvent is precisely the thing
+        # that is missing, and reaching for it would leave the panel waiting
+        # on a Done that never comes.
+        [void] $shell.AddScript({
+            param($Channel, $Source, $Work, $BootstrapPath, $Arguments)
+
+            $started = [datetime]::UtcNow
+            # Defaults to failure, not success. An unrecognised result shape
+            # (see below) must never read as a completed run -- this repo has
+            # already shipped the opposite mistake once: src/99-Main.ps1's
+            # long comment on the try around output-path validation records
+            # an unwritable -OutputPath that used to produce a confident
+            # "Report complete", real-looking numbers, and exit 0, with
+            # nothing written to disk.
+            $exitCode = 1
+            $reportPath = $null
+
+            try {
+                if ($BootstrapPath -and @($BootstrapPath).Count -gt 0) {
+                    # $env: is PROCESS scope, not runspace scope -- shared
+                    # with the parent session and every other runspace in
+                    # this process. Verified directly: a variable set inside
+                    # a [powershell]::Create() runspace is visible back in
+                    # the parent. Left set, a second in-session run would
+                    # find CITRIXUSAGEREPORT_SUPPRESS_MAIN already '1' and
+                    # 99-Main.ps1's own entry-point guard would turn its
+                    # dot-source into a silent no-op -- no window, no console
+                    # output, no error, nothing written to disk. Captured and
+                    # restored around just this loop, which is safe because
+                    # only one run's worker bootstraps at a time.
+                    $priorSuppressMain = $env:CITRIXUSAGEREPORT_SUPPRESS_MAIN
+                    try {
+                        $env:CITRIXUSAGEREPORT_SUPPRESS_MAIN = '1'
+                        # In the order given, which is build.ps1's own
+                        # concatenation order: a later file may redefine
+                        # something an earlier one set, and the runspace must
+                        # end up with the same definitions the built script
+                        # would have. 99-Main.ps1's entry point is guarded on
+                        # the environment variable set just above, so
+                        # dot-sourcing it does not start a second run. Any one
+                        # of these failing throws, which the catch blocks below
+                        # turn into a Done event rather than a panel waiting
+                        # forever for one.
+                        foreach ($bootstrapFile in $BootstrapPath) {
+                            . $bootstrapFile
+                        }
+                    } finally {
+                        if ($null -eq $priorSuppressMain) {
+                            Remove-Item Env:\CITRIXUSAGEREPORT_SUPPRESS_MAIN -ErrorAction SilentlyContinue
+                        } else {
+                            $env:CITRIXUSAGEREPORT_SUPPRESS_MAIN = $priorSuppressMain
+                        }
+                    }
+                }
+
+                # $Work crosses into this runspace as a live object (AddArgument
+                # passes objects by reference in-process, unlike AddScript, which
+                # converts a scriptblock argument to source text and so already
+                # compiles fresh here). A scriptblock object keeps the session-
+                # state affinity of wherever it was written, so invoking the
+                # ORIGINAL object here would not run "in this runspace" at all --
+                # it would silently run against the caller's session on this
+                # background thread while that caller keeps running on its own,
+                # racing its session state with the bootstrap this file just
+                # performed. Rebuilding it from its own source text, from code
+                # that is itself already running in this runspace, is what
+                # actually binds it here.
+                $localWork = [scriptblock]::Create($Work.ToString())
+                $result = & $localWork $Channel $Source $Arguments
+
+                # Assignment collects every object the work writes to the
+                # pipeline, not just the last statement's value -- if anything
+                # anywhere in its call chain (or, for Task 11, anywhere inside
+                # Invoke-ReportRun) emits a stray unrequested object, $result
+                # becomes an array here. Collapsing to the last element is
+                # what the work actually intended to return; only the shape
+                # of THAT is inspected below.
+                $resultArray = @($result)
+                if ($resultArray.Count -gt 0) { $result = $resultArray[$resultArray.Count - 1] } else { $result = $null }
+
+                # $result is whatever the injected work returned. The tests
+                # here return a hashtable or an [ordered] dictionary; the real
+                # work (Task 11, wrapping Invoke-ReportRun) returns that
+                # function's own OutputType, a pscustomobject -- which has no
+                # ContainsKey method at all, so a hashtable-only read would
+                # throw *after* the run has already succeeded or failed,
+                # discarding the real ExitCode. Checked against the
+                # non-generic IDictionary interface rather than [hashtable]
+                # specifically, so an [ordered] dictionary (which does not
+                # inherit from Hashtable) is recognised too. Anything else --
+                # $null, an array, a string, a number -- is an unrecognised
+                # shape and leaves $exitCode at its already-failed default
+                # rather than being read as ExitCode 0.
+                if ($result -is [System.Collections.IDictionary]) {
+                    if ($result.Contains('ExitCode')) { $exitCode = [int] $result['ExitCode'] }
+                    if ($result.Contains('ReportPath')) { $reportPath = $result['ReportPath'] }
+                } elseif ($result -is [pscustomobject]) {
+                    $exitCodeProp = $result.PSObject.Properties['ExitCode']
+                    if ($exitCodeProp) { $exitCode = [int] $exitCodeProp.Value }
+                    $reportPathProp = $result.PSObject.Properties['ReportPath']
+                    if ($reportPathProp) { $reportPath = $reportPathProp.Value }
+                }
+
+            } catch [System.OperationCanceledException] {
+                # 2 is what the existing "Canceled." path has always returned.
+                $exitCode = 2
+                $Channel.Enqueue(@{ Kind = 'Log'; Level = 'Warn'; Text = 'Run canceled by the operator.' })
+
+            } catch {
+                $exitCode = 1
+                # Straight onto the channel, not through Write-ReportLog, so
+                # this has to redact for itself: the pane must never show
+                # more than the log file does. Get-RedactedText only exists
+                # if the bootstrap got far enough to define it -- and if it
+                # did not, no secret was ever loaded here to leak.
+                $errorText = $_.Exception.Message
+                $stackText = $_.ScriptStackTrace
+                if (Get-Command Get-RedactedText -CommandType Function -ErrorAction SilentlyContinue) {
+                    try {
+                        $errorText = Get-RedactedText -Text $errorText
+                        $stackText = Get-RedactedText -Text $stackText
+                    } catch { }
+                }
+                $Channel.Enqueue(@{ Kind = 'Log'; Level = 'Error'; Text = $errorText })
+                if ($stackText) {
+                    $Channel.Enqueue(@{ Kind = 'Log'; Level = 'Debug'; Text = $stackText })
+                }
+
+            } finally {
+                # Unconditional. The panel polls until it sees this, so failing to
+                # publish it is a hung window -- a worse outcome than any error.
+                $Channel.Enqueue(@{
+                    Kind       = 'Done'
+                    ExitCode   = $exitCode
+                    ReportPath = $reportPath
+                    Elapsed    = ([datetime]::UtcNow - $started)
+                })
+            }
+        })
+
+        [void] $shell.AddArgument($Channel)
+        [void] $shell.AddArgument($Source)
+        [void] $shell.AddArgument($Work)
+        [void] $shell.AddArgument($BootstrapPath)
+        [void] $shell.AddArgument($Arguments)
+
+        $handle = $shell.BeginInvoke()
+
+        return @{
+            Shell    = $shell
+            Runspace = $runspace
+            Source   = $Source
+            Handle   = $handle
+        }
+
+    } catch {
+        # $Channel is untyped (Mandatory accepts an explicit $null, which
+        # satisfies "the parameter was supplied" without giving us anything
+        # with an Enqueue method), so even these two lines are guarded --
+        # this whole function promises never to throw, and reaching for the
+        # channel is exactly the kind of thing that must not undo that
+        # promise on the one path that is already a failure.
+        try { $Channel.Enqueue(@{ Kind = 'Log'; Level = 'Error'; Text = "Could not start the background run: $($_.Exception.Message)" }) } catch { }
+        try { $Channel.Enqueue(@{ Kind = 'Done'; ExitCode = 1; ReportPath = $null; Elapsed = [timespan]::Zero }) } catch { }
+
+        try { if ($shell) { $shell.Dispose() } } catch { }
+        try { if ($runspace) { $runspace.Close(); $runspace.Dispose() } } catch { }
+
+        return @{ Shell = $null; Runspace = $null; Source = $Source; Handle = $null }
+    }
+}
+
+function Test-ReportWorkerComplete {
+    <#
+    .SYNOPSIS
+        True once the background work has finished.
+    .DESCRIPTION
+        Also true once the worker has been torn down (Stop-ReportWorker nulls
+        Handle): a caller polling this in a loop must eventually see it turn
+        true, and a torn-down worker can never again report otherwise, so it
+        is exactly as "done" as one whose pipeline finished on its own.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][hashtable] $Worker)
+
+    if (-not $Worker.Handle) { return $true }
+    return [bool] $Worker.Handle.IsCompleted
+}
+
+function Stop-ReportWorker {
+    <#
+    .SYNOPSIS
+        Releases the runspace, waiting for it to actually stop. Safe to call
+        more than once, and on $null.
+    .DESCRIPTION
+        Never throws: this runs from form teardown, where an exception would
+        leave the process alive with a hidden window.
+
+        $Worker may be $null -- Task 11 leaves the worker unset until Run is
+        clicked, so closing the window before any run, or after a reset,
+        calls this with nothing to stop.
+
+        BLOCKS THE CALLER. $StopTimeoutMilliseconds only bounds the polite
+        wait for cancellation to be noticed -- it does not bound what comes
+        after. PowerShell.Stop(), and Dispose() called on still-running work,
+        do not preempt non-cooperative native code (a synchronous network or
+        COM call, which real Citrix work almost certainly contains): both
+        block the CALLING thread until the pipeline itself yields back to the
+        engine, however long that takes. Measured directly against a pipeline
+        parked in a 30-second blocking sleep: Stop() took ~29s, and Dispose()
+        called on still-running work took ~14s. Neither threw, neither
+        leaked -- both simply blocked for as long as the native call did.
+
+        That makes this function fine for tests and console callers, which
+        legitimately want to wait for the outcome, but wrong to call from
+        FormClosing: it can freeze the message pump for as long as whatever
+        the work happened to be blocked in. Use Stop-ReportWorkerAsync there.
+
+        Has no production caller any more -- only this file's own test suite
+        calls it directly. Do not delete it as dead code: it is the
+        synchronous primitive Stop-ReportWorkerAsync's fire-and-forget
+        teardown is defined against and measured relative to, and
+        Gui.Tests.ps1 asserts on 90-Gui.ps1's source text that FormClosing
+        names ONLY the Async function, never this one -- so the two must stay
+        separate, not merged back together, even though nothing but tests
+        exercises this half any more.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [hashtable] $Worker,
+        # Generous for real use (a phase boundary can be minutes away) while
+        # still finite; tests pass a much shorter value so a worker that
+        # deliberately ignores cancellation doesn't make the suite slow.
+        [int] $StopTimeoutMilliseconds = 5000
+    )
+
+    if (-not $Worker) { return }
+
+    try {
+        if ($Worker.Source -and -not $Worker.Source.IsCancellationRequested) {
+            $Worker.Source.Cancel()
+        }
+    } catch { }
+
+    try {
+        if ($Worker.Shell -and $Worker.Handle) {
+            if (-not $Worker.Handle.AsyncWaitHandle.WaitOne($StopTimeoutMilliseconds)) {
+                # Cancellation alone did not stop it in time -- either the
+                # work does not check $Source, or it is blocked somewhere
+                # that does not respond to it. Stop() aborts the pipeline
+                # outright rather than let form teardown hang indefinitely.
+                try { $Worker.Shell.Stop() } catch { }
+            }
+        }
+    } catch { }
+
+    try { if ($Worker.Shell -and $Worker.Handle) { [void] $Worker.Shell.EndInvoke($Worker.Handle) } } catch { }
+    try { if ($Worker.Shell) { $Worker.Shell.Dispose() } } catch { }
+    try { if ($Worker.Runspace) { $Worker.Runspace.Close(); $Worker.Runspace.Dispose() } } catch { }
+
+    $Worker.Shell = $null
+    $Worker.Handle = $null
+    $Worker.Runspace = $null
+}
+
+function Stop-ReportWorkerAsync {
+    <#
+    .SYNOPSIS
+        Requests the worker stop and returns immediately, without waiting for
+        it to actually happen. Safe to call more than once, and on $null.
+    .DESCRIPTION
+        This is what FormClosing must call, never Stop-ReportWorker. As that
+        function's own doc comment now says: Stop() and Dispose(), against
+        work parked in a non-cooperative blocking call, block the CALLING
+        thread for as long as that call takes -- up to tens of seconds,
+        measured. Called synchronously from FormClosing, that is the window
+        becoming unclosable, which is the one outcome this whole feature
+        exists to prevent. So nothing here waits on anything:
+
+          1. Cancellation is requested immediately, synchronously, on the
+             caller's thread -- this only sets a flag and is effectively free.
+          2. The actual Stop() / EndInvoke() / Dispose() sequence is handed to
+             a brand-new, disposable runspace of its own, started with
+             BeginInvoke() exactly like the worker itself was, and this
+             function returns before that teardown has necessarily made any
+             progress at all. (A raw ThreadPool callback was tried first and
+             rejected: invoking a PowerShell scriptblock as a bare
+             System.Threading.WaitCallback delegate does not reliably run at
+             all in Windows PowerShell 5.1 -- it was observed to make the
+             calling script hang. A one-off runspace is the same mechanism
+             this file already uses and relies on elsewhere, so it is known
+             to actually work.)
+          3. That teardown script swallows every exception itself: it runs
+             unattended, with nothing left watching for its result, so
+             nothing is there to catch or report one.
+
+        A runspace's own thread is a FOREGROUND thread: measured directly,
+        closing a script's main thread while a busy runspace of its own is
+        still running does NOT end the host process -- it stays alive,
+        invisibly, until that runspace's pipeline finishes on its own (in the
+        experiment, exactly as long as the blocking call inside it). This
+        function fixes the frozen-window symptom, but it does not, and
+        cannot, make a process holding a genuinely stuck blocking call exit
+        immediately -- the teardown runspace this hands the work to is itself
+        just as much a foreground thread as the original one was. That is a
+        real, separate risk from the one this function fixes, called out
+        here deliberately rather than left for someone to discover later.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()]
+        [hashtable] $Worker
+    )
+
+    if (-not $Worker) { return }
+
+    try {
+        if ($Worker.Source -and -not $Worker.Source.IsCancellationRequested) {
+            $Worker.Source.Cancel()
+        }
+    } catch { }
+
+    $realShell = $Worker.Shell
+    $realHandle = $Worker.Handle
+    $realRunspace = $Worker.Runspace
+
+    # Clear the caller's copy immediately -- from this function's own
+    # contract, the worker is "stopped" the moment this returns, regardless
+    # of how much of the actual teardown has run yet.
+    $Worker.Shell = $null
+    $Worker.Handle = $null
+    $Worker.Runspace = $null
+
+    if (-not $realShell -and -not $realRunspace) { return }
+
+    try {
+        $teardownRunspace = [runspacefactory]::CreateRunspace()
+        $teardownRunspace.Open()
+        $teardownShell = [powershell]::Create()
+        $teardownShell.Runspace = $teardownRunspace
+
+        [void] $teardownShell.AddScript({
+            param($RealShell, $RealHandle, $RealRunspace)
+            # Must never throw: this runs unattended, on a runspace nobody is
+            # ever going to check the result of.
+            try {
+                if ($RealShell) {
+                    try { $RealShell.Stop() } catch { }
+                    try { if ($RealHandle) { [void] $RealShell.EndInvoke($RealHandle) } } catch { }
+                    try { $RealShell.Dispose() } catch { }
+                }
+            } catch { }
+            try { if ($RealRunspace) { $RealRunspace.Close(); $RealRunspace.Dispose() } } catch { }
+        })
+        [void] $teardownShell.AddArgument($realShell)
+        [void] $teardownShell.AddArgument($realHandle)
+        [void] $teardownShell.AddArgument($realRunspace)
+
+        # Fire and forget. Not disposing $teardownShell/$teardownRunspace
+        # here is deliberate, not an oversight: this function must return
+        # before the teardown work has necessarily done anything, so there is
+        # nothing safe to wait for before cleaning them up. The pending async
+        # operation keeps them alive for as long as it runs; once it
+        # completes, with nothing left referencing either, they become
+        # ordinary garbage.
+        [void] $teardownShell.BeginInvoke()
+    } catch {
+        # Could not even start the async teardown (e.g. the process is out of
+        # threads). There is nothing further to fall back to that would not
+        # itself risk blocking -- this function's contract is "return
+        # immediately" above all else, so the failure is swallowed rather
+        # than escalated to a synchronous Stop-ReportWorker call here.
+    }
+}
+
+# endregion 93-RunHost.ps1
 
 # ----------------------------------------------------------------------------
 # region 99-Main.ps1
@@ -5664,19 +10840,227 @@ function Read-AuditConfigFromConsole {
 # ============================================================================
 #  Orchestration
 #
-#  config -> preflight -> fetch -> analyse -> render -> export
+#  config -> preflight -> fetch -> analyze -> render -> export
 # ============================================================================
 
-function Invoke-CitrixUsageAudit {
+function Get-ReportRunConfig {
     <#
     .SYNOPSIS
-        Runs a complete audit.
+        Decides what this run is: from the dialog, the console prompts, or
+        the command line.
+    .DESCRIPTION
+        Split out of Invoke-CitrixUsageReport so that "get the configuration"
+        and "run the report" are two separately callable things. While both
+        halves lived in one function body there was nothing to hand a
+        background runspace, which is why the dialog had to close before any
+        work could start.
     .OUTPUTS
-        An exit code: 0 success, 1 failure, 2 cancelled.
+        THREE shapes, and a caller must tell them apart before doing anything
+        with the result:
+
+          * A run configuration, to be handed to Invoke-ReportRun.
+          * Nothing at all, if the operator canceled.
+          * [pscustomobject]@{ GuiExitCode = <int> }, when the dialog was
+            shown. The dialog now RUNS THE REPORT ITSELF and stays open while
+            it does, so this is a finished run's exit code and not a
+            configuration. Handing it to Invoke-ReportRun would run the whole
+            report a second time. Test for the GuiExitCode property before
+            treating the result as a configuration, as
+            Invoke-CitrixUsageReport does.
     #>
     [CmdletBinding()]
-    [OutputType([int])]
-    param([hashtable] $BoundParameters = @{})
+    [OutputType([pscustomobject])]
+    param(
+        [hashtable] $BoundParameters = @{},
+        [Parameter(Mandatory)][string] $DefaultOutputPath
+    )
+
+    # Set here as well as in the caller because preference variables are
+    # dynamically scoped: a direct caller of this function (a test, or the
+    # runspace a later change hands the work to) would otherwise inherit
+    # whatever its own session had set. See the long note in Invoke-ReportRun
+    # for why 'Stop' is the only safe setting in this call chain.
+    $ErrorActionPreference = 'Stop'
+
+    # -Merge counts as connection details: it says where the data comes
+    # from just as definitely as a controller name does, and a run that
+    # supplied it must not be diverted into the dialog.
+    $interactive = -not ($BoundParameters.ContainsKey('DeliveryController') -or
+                         $BoundParameters.ContainsKey('CustomerId') -or
+                         $BoundParameters.ContainsKey('DemoData') -or
+                         $BoundParameters.ContainsKey('Merge'))
+
+    if ($interactive) {
+        # In the interactive path the configuration comes wholly from the
+        # dialog (or the console prompts), so anything else the caller
+        # bound on the command line is thrown away. Doing that silently
+        # produced a report that looked fine and simply was not the run
+        # the operator asked for -- a -Anonymize that never happened is
+        # the worst case. OutputPath and NoGui are excluded because both
+        # ARE honored: OutputPath seeds the dialog's default, and NoGui
+        # selects the console path.
+        $ignorable = @('Environment','DeliveryController','Protocol','CustomerId','ClientId',
+                       'ClientSecret','Credential','Days','IncludeDeliveryGroups',
+                       'IncludeApplications','IncludeClientDevices','IncludeTrend',
+                       'Anonymize','ExportRawData','ExportForMerge','SaltPath',
+                       'AllowUnanonymizedMergeExport')
+        $ignored = @($ignorable | Where-Object { $BoundParameters.ContainsKey($_) })
+        if ($ignored.Count -gt 0) {
+            Write-ReportLog -Level Warn -Message ("No connection details were supplied on the command line, so this run is being configured from the dialog and these parameter(s) are IGNORED: -{0}. Set them in the dialog instead, or add -DeliveryController / -CustomerId / -DemoData to run non-interactively." -f ($ignored -join ', -'))
+        }
+
+        # A WinForms dialog can only be shown from a single-threaded
+        # apartment. Test-GuiAvailable (src/90-Gui.ps1) checks that
+        # WinForms loads and that the host is interactive, but it does
+        # not -- and must not, since it has no reason to know its
+        # caller's threading model -- check apartment state. This is the
+        # entry point that decides GUI vs. console, so the check belongs
+        # here: calling Show-ReportGui from an MTA thread would pass
+        # Test-GuiAvailable and then throw from ShowDialog() itself,
+        # turning a should-be console fallback into a crash.
+        $guiRequested = -not $BoundParameters['NoGui']
+        $guiAvailable = $guiRequested -and (Test-GuiAvailable)
+
+        if ($guiAvailable -and
+            [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne
+            [System.Threading.ApartmentState]::STA) {
+            Write-ReportLog -Level Warn -Message 'The graphical dialog requires a single-threaded apartment (STA); this session is not one. Falling back to console prompts.'
+            $guiAvailable = $false
+        }
+
+        if ($guiAvailable) {
+            # The dialog no longer hands back a configuration to be run
+            # afterwards -- it stays open and runs the report inside itself,
+            # so by the time this returns the run is over and all that is
+            # left is its exit code. Reported as a distinctly-shaped object
+            # rather than as a bare integer because this function's whole
+            # contract is "a configuration, or nothing", and a caller that
+            # took an exit code for a configuration would hand it straight to
+            # Invoke-ReportRun and run the report a second time.
+            return [pscustomobject]@{
+                GuiExitCode = [int] (Show-ReportGui -DefaultOutputPath $DefaultOutputPath)
+            }
+        }
+
+        $config = Read-ReportConfigFromConsole -DefaultOutputPath $DefaultOutputPath
+
+        # A cancellation is reported as "no configuration" rather than as an
+        # exit code, because what a cancellation means is the caller's
+        # decision: the console entry point turns it into exit 2, and a
+        # caller still showing a dialog simply leaves it where it was.
+        if (-not $config) { return }
+
+        return $config
+    }
+
+    # Pre-assigned to plain locals rather than threaded through a
+    # $(if ...) subexpression: see the array-convention note in
+    # src/60-Analytics.ps1's Invoke-ReportAnalysis. Days is the one
+    # value here that is genuinely array-typed, so it is the one
+    # genuinely at risk of the single-element collapse; the rest are
+    # scalars and are pre-assigned only for consistency and
+    # readability.
+    $reportEnvironment = 'OnPremises'
+    if ($BoundParameters['Environment']) { $reportEnvironment = $BoundParameters['Environment'] }
+
+    # $Days is [string[]] on the command line (see src/00-Header.ps1
+    # for why), not [int[]]: under `-File` -- the invocation the
+    # runbook must recommend, since it is the one that works with
+    # -ExecutionPolicy Bypass against a Restricted default policy --
+    # PowerShell hands the script raw argv strings and parses none
+    # of it as PowerShell syntax. `-Days 30,60,90` arrives as ONE
+    # string "30,60,90" under -File, but as three separate strings
+    # "30","60","90" when the same call is dot-sourced or invoked
+    # via -Command (where a real array literal is parsed). Joining
+    # whatever shape arrived back into one comma-separated string
+    # before handing it to ConvertTo-DaysArray (src/90-Gui.ps1, the
+    # same parser the GUI and console paths already use) normalizes
+    # both shapes -- and a single value -- to the same result:
+    # @("30,60,90") -join ',' and @("30","60","90") -join ',' both
+    # produce "30,60,90". ConvertTo-DaysArray itself is only defined
+    # by the time this function runs, not while the script's param
+    # block is being bound, which is why the parsing happens here.
+    $reportDays = @(30, 60, 90)
+    if ($BoundParameters['Days']) {
+        $reportDays = @(ConvertTo-DaysArray -Text (($BoundParameters['Days'] -join ',')))
+    }
+
+    $reportProtocol = 'Https'
+    if ($BoundParameters['Protocol']) { $reportProtocol = [string] $BoundParameters['Protocol'] }
+
+    # Resolved before the config is built, because consolidating
+    # existing exports needs neither an endpoint nor a controller.
+    $mergePaths = @()
+    if ($BoundParameters['Merge']) { $mergePaths = @($BoundParameters['Merge'] | Where-Object { $_ }) }
+
+    $config = New-ReportConfig `
+        -MergePaths $mergePaths `
+        -UseUpnBridge:($BoundParameters['CrossForestKey'] -eq 'Upn') `
+        -ExcludeBridgeUpn ([string[]] $BoundParameters['ExcludeBridgeUpn']) `
+        -Environment $reportEnvironment `
+        -DeliveryController ([string] $BoundParameters['DeliveryController']) `
+        -Protocol $reportProtocol `
+        -CustomerId ([string] $BoundParameters['CustomerId']) `
+        -ClientId ([string] $BoundParameters['ClientId']) `
+        -ClientSecret $BoundParameters['ClientSecret'] `
+        -Credential $BoundParameters['Credential'] `
+        -Days $reportDays `
+        -OutputPath $DefaultOutputPath `
+        -IncludeDeliveryGroups:([bool] $BoundParameters['IncludeDeliveryGroups']) `
+        -IncludeApplications:([bool] $BoundParameters['IncludeApplications']) `
+        -IncludeClientDevices:([bool] $BoundParameters['IncludeClientDevices']) `
+        -IncludeTrend:([bool] $BoundParameters['IncludeTrend']) `
+        -Anonymize:([bool] $BoundParameters['Anonymize']) `
+        -ExportForMerge:([bool] $BoundParameters['ExportForMerge']) `
+        -SaltPath ([string] $BoundParameters['SaltPath']) `
+        -AllowUnanonymizedMergeExport:([bool] $BoundParameters['AllowUnanonymizedMergeExport']) `
+        -ExportRawData:([bool] $BoundParameters['ExportRawData']) `
+        -DemoData:([bool] $BoundParameters['DemoData'])
+
+    Test-ReportConfig -Config $config
+
+    return $config
+}
+
+function Invoke-ReportRun {
+    <#
+    .SYNOPSIS
+        Runs the report for an already-built configuration.
+    .DESCRIPTION
+        Split out of Invoke-CitrixUsageReport so the work is callable
+        independently of how the configuration was obtained. That is what lets
+        the GUI hand it to a background runspace and stay open, instead of
+        closing the dialog and running in a console nobody is looking at.
+    .OUTPUTS
+        ExitCode, ReportPath and RunDirectory. Never throws: a failed run
+        comes back as ExitCode 1, exactly as the console path already
+        reported it.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)][pscustomobject] $Config,
+        # Called as & $ProgressAction $stage $percent during analysis, and as
+        # & $CollectAction $entity $count during the fetch. Left unset, both
+        # fall back to the Write-Progress bars the console path has always
+        # drawn. That fallback is the whole guarantee that a -NoGui run is
+        # unchanged by this split, so it is asserted in the tests rather than
+        # assumed.
+        [scriptblock] $ProgressAction,
+        [scriptblock] $CollectAction,
+        # Called as & $PhaseAction $name $state at each boundary below, with
+        # a name from Get-RunPhaseList (src/15-RunChannel.ps1) and a state of
+        # Active, Done, Failed or Cancelled. This is the ONLY thing that can
+        # drive the panel's phase column honestly: nothing else in the run
+        # knows which phase it is in, and deriving one from log text would be
+        # a second, silently-drifting copy of the phase list. Left unset for
+        # the console path, where there is no column to update.
+        [scriptblock] $PhaseAction,
+        # Suppresses the courtesy "open the finished report" at the end. The
+        # console entry point passes the operator's -NoGui straight through
+        # here, which is the same guard this carried inline before the split.
+        [switch] $NoLaunch
+    )
 
     # Every cmdlet failure anywhere in this call chain must reach the catch
     # block below, which is the only place a customer-facing message and a
@@ -5684,142 +11068,106 @@ function Invoke-CitrixUsageAudit {
     # failures (New-Item, Set-Content, Join-Path against a missing drive,
     # ...) are non-terminating: they print a raw error to the console and
     # execution continues past them as if nothing had happened -- which is
-    # how an unwritable -OutputPath used to produce a confident "Audit
+    # how an unwritable -OutputPath used to produce a confident "Report
     # complete", real-looking numbers, and exit 0, with nothing written to
     # disk. Assigned to a local (function-scoped) variable, not $global:, so
     # it cannot leak into a caller's session -- e.g. the test suite, which
     # dot-sources this file and must not have its own preference silently
-    # overwritten. Write-AuditLog's own internal try/catch around its log
+    # overwritten. Write-ReportLog's own internal try/catch around its log
     # write already sets -ErrorAction Stop explicitly and catches it itself,
     # so logging still degrades to console-only on a write failure rather
     # than becoming the reason a run fails, regardless of this setting.
+    #
+    # Set inside this function rather than relying on the entry point's copy
+    # because preference variables are dynamically scoped: a caller that is
+    # not Invoke-CitrixUsageReport -- a test, or the background runspace a
+    # later change hands the work to -- would otherwise silently run the
+    # whole report under its own preference.
     $ErrorActionPreference = 'Stop'
 
+    if (-not $ProgressAction) {
+        # Id 2, distinct from the fetch's Id 1: two bars sharing an id
+        # overwrite one another. At 500,000 sessions the analysis runs for
+        # hours, and without this the console is silent for all of it.
+        $ProgressAction = {
+            param($Stage, $Percent)
+            Write-Progress -Activity 'Analyzing usage data' -Status $Stage `
+                -PercentComplete $Percent -Id 2
+        }
+    }
+    if (-not $CollectAction) {
+        $CollectAction = {
+            param($Entity, $Count)
+            Write-Progress -Activity 'Collecting Citrix usage data' `
+                -Status "$Entity : $Count record(s)" -Id 1
+        }
+    }
+
+    # The phase the run is currently inside, so the two catch blocks below can
+    # mark THAT one Failed or Cancelled rather than leaving it stuck on Active
+    # -- a panel whose last phase never resolves reads as a run still going.
+    # Maintained by plain assignment at each boundary rather than from inside
+    # $emitPhase: `& $scriptblock` runs in a CHILD scope, so an assignment
+    # made in there would create a new local and leave this one untouched.
+    $activePhase = $null
+    # One local wrapper so the null check and the guard are written once. A
+    # broken or slow phase callback must never be the reason a five-hour run
+    # fails, so it is swallowed here exactly as Write-ReportLog swallows a
+    # failing log sink.
+    $emitPhase = {
+        param([string] $Name, [string] $State)
+        # Piped to Out-Null because most of these calls sit inside the
+        # $dataset = if (...) expression below, where anything the callback
+        # wrote to the pipeline would be collected into the dataset itself.
+        if ($PhaseAction) { try { & $PhaseAction $Name $State | Out-Null } catch { } }
+    }
+
+    # Taken here, when the run actually starts, not once at process start --
+    # the dialog now stays open and can sit idle for any length of time
+    # before Run is clicked, so a GUI run's output directory is named for
+    # when the run happened, not when the process was launched.
     $stamp = [DateTime]::Now.ToString('yyyyMMdd-HHmmss')
 
+    # Declared before the try so the catch can still say how far the run got.
+    # A failure after the run directory exists leaves the log inside it, and
+    # a caller that never learns the path cannot point anyone at it.
+    $runDir     = $null
+    $reportPath = $null
+
+    # Files this run has started writing. Anything still listed when the run
+    # ends badly gets removed: a truncated CitrixUsageReport.html still opens
+    # in a browser and still shows figures, which is precisely the kind of
+    # confidently-wrong output this tool exists to avoid. Declared before the
+    # try, alongside $runDir and $reportPath above, so both catch blocks
+    # below can still see it.
+    $opened = New-Object System.Collections.Generic.List[string]
+
     try {
-        # ---- Configuration -------------------------------------------------
-        $defaultOut = if ($BoundParameters.ContainsKey('OutputPath')) {
-            $BoundParameters['OutputPath']
-        } else {
-            Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'CitrixUsageReport'
-        }
-
-        $interactive = -not ($BoundParameters.ContainsKey('DeliveryController') -or
-                             $BoundParameters.ContainsKey('CustomerId') -or
-                             $BoundParameters.ContainsKey('DemoData'))
-
-        if ($interactive) {
-            # In the interactive path the configuration comes wholly from the
-            # dialog (or the console prompts), so anything else the caller
-            # bound on the command line is thrown away. Doing that silently
-            # produced a report that looked fine and simply was not the run
-            # the operator asked for -- a -Anonymize that never happened is
-            # the worst case. OutputPath and NoGui are excluded because both
-            # ARE honoured: OutputPath seeds the dialog's default, and NoGui
-            # selects the console path.
-            $ignorable = @('Environment','DeliveryController','Protocol','CustomerId','ClientId',
-                           'ClientSecret','Credential','Days','IncludeDeliveryGroups',
-                           'IncludeApplications','IncludeClientDevices','IncludeTrend',
-                           'Anonymize','ExportRawData')
-            $ignored = @($ignorable | Where-Object { $BoundParameters.ContainsKey($_) })
-            if ($ignored.Count -gt 0) {
-                Write-AuditLog -Level Warn -Message ("No connection details were supplied on the command line, so this run is being configured from the dialog and these parameter(s) are IGNORED: -{0}. Set them in the dialog instead, or add -DeliveryController / -CustomerId / -DemoData to run non-interactively." -f ($ignored -join ', -'))
-            }
-
-            # A WinForms dialog can only be shown from a single-threaded
-            # apartment. Test-GuiAvailable (src/90-Gui.ps1) checks that
-            # WinForms loads and that the host is interactive, but it does
-            # not -- and must not, since it has no reason to know its
-            # caller's threading model -- check apartment state. This is the
-            # entry point that decides GUI vs. console, so the check belongs
-            # here: calling Show-AuditGui from an MTA thread would pass
-            # Test-GuiAvailable and then throw from ShowDialog() itself,
-            # turning a should-be console fallback into a crash.
-            $guiRequested = -not $BoundParameters['NoGui']
-            $guiAvailable = $guiRequested -and (Test-GuiAvailable)
-
-            if ($guiAvailable -and
-                [System.Threading.Thread]::CurrentThread.GetApartmentState() -ne
-                [System.Threading.ApartmentState]::STA) {
-                Write-AuditLog -Level Warn -Message 'The graphical dialog requires a single-threaded apartment (STA); this session is not one. Falling back to console prompts.'
-                $guiAvailable = $false
-            }
-
-            $config = if ($guiAvailable) {
-                Show-AuditGui -DefaultOutputPath $defaultOut
-            } else {
-                Read-AuditConfigFromConsole -DefaultOutputPath $defaultOut
-            }
-
-            if (-not $config) {
-                Write-Host 'Cancelled.' -ForegroundColor Yellow
-                return 2
-            }
-        } else {
-            # Pre-assigned to plain locals rather than threaded through a
-            # $(if ...) subexpression: see the array-convention note in
-            # src/60-Analytics.ps1's Invoke-AuditAnalysis. Days is the one
-            # value here that is genuinely array-typed, so it is the one
-            # genuinely at risk of the single-element collapse; the rest are
-            # scalars and are pre-assigned only for consistency and
-            # readability.
-            $auditEnvironment = 'OnPremises'
-            if ($BoundParameters['Environment']) { $auditEnvironment = $BoundParameters['Environment'] }
-
-            # $Days is [string[]] on the command line (see src/00-Header.ps1
-            # for why), not [int[]]: under `-File` -- the invocation the
-            # runbook must recommend, since it is the one that works with
-            # -ExecutionPolicy Bypass against a Restricted default policy --
-            # PowerShell hands the script raw argv strings and parses none
-            # of it as PowerShell syntax. `-Days 30,60,90` arrives as ONE
-            # string "30,60,90" under -File, but as three separate strings
-            # "30","60","90" when the same call is dot-sourced or invoked
-            # via -Command (where a real array literal is parsed). Joining
-            # whatever shape arrived back into one comma-separated string
-            # before handing it to ConvertTo-DaysArray (src/90-Gui.ps1, the
-            # same parser the GUI and console paths already use) normalises
-            # both shapes -- and a single value -- to the same result:
-            # @("30,60,90") -join ',' and @("30","60","90") -join ',' both
-            # produce "30,60,90". ConvertTo-DaysArray itself is only defined
-            # by the time this function runs, not while the param block
-            # above is being bound, which is why the parsing happens here.
-            $auditDays = @(30, 60, 90)
-            if ($BoundParameters['Days']) {
-                $auditDays = @(ConvertTo-DaysArray -Text (($BoundParameters['Days'] -join ',')))
-            }
-
-            $auditProtocol = 'Https'
-            if ($BoundParameters['Protocol']) { $auditProtocol = [string] $BoundParameters['Protocol'] }
-
-            $config = New-AuditConfig `
-                -Environment $auditEnvironment `
-                -DeliveryController ([string] $BoundParameters['DeliveryController']) `
-                -Protocol $auditProtocol `
-                -CustomerId ([string] $BoundParameters['CustomerId']) `
-                -ClientId ([string] $BoundParameters['ClientId']) `
-                -ClientSecret $BoundParameters['ClientSecret'] `
-                -Credential $BoundParameters['Credential'] `
-                -Days $auditDays `
-                -OutputPath $defaultOut `
-                -IncludeDeliveryGroups:([bool] $BoundParameters['IncludeDeliveryGroups']) `
-                -IncludeApplications:([bool] $BoundParameters['IncludeApplications']) `
-                -IncludeClientDevices:([bool] $BoundParameters['IncludeClientDevices']) `
-                -IncludeTrend:([bool] $BoundParameters['IncludeTrend']) `
-                -Anonymize:([bool] $BoundParameters['Anonymize']) `
-                -ExportRawData:([bool] $BoundParameters['ExportRawData']) `
-                -DemoData:([bool] $BoundParameters['DemoData'])
-
-            Test-AuditConfig -Config $config
+        # The dialog has a consolidation mode of its own, so the paths come
+        # back on the config exactly as they do from -Merge. Reading them
+        # from the config rather than from bound parameters is what makes
+        # the two sources of configuration indistinguishable to this
+        # function. Moved inside the try (Task 5's review noted it used to
+        # sit above it, a leftover of the extraction from
+        # Invoke-CitrixUsageReport): Task 11 hand-builds config objects
+        # rather than going through New-ReportConfig, and a config missing
+        # MergePaths entirely must fail somewhere this function's own catch
+        # can see, not above it. The property-existence check also matters
+        # on its own: @($null) has .Count 1, so a config that simply never
+        # set MergePaths would otherwise silently route down the
+        # consolidation branch below as if one (empty) path had been given.
+        $mergePaths = @()
+        if ($Config.PSObject.Properties['MergePaths']) {
+            $mergePaths = @($Config.MergePaths | Where-Object { $_ })
         }
 
         # ---- Output location and logging ------------------------------------
         # Validated and probed for real writability here, before any other
-        # work (including Initialize-AuditLog and the fetch/generate step
+        # work (including Initialize-ReportLog and the fetch/generate step
         # below, which can run for minutes): a nonexistent drive or an
         # access-denied location must fail immediately with a message naming
         # the path, not silently continue into a run that ends in a
-        # confident "Audit complete" with nothing on disk, and not surface
+        # confident "Report complete" with nothing on disk, and not surface
         # as some unrelated-looking error one statement further on (a
         # nonexistent drive letter makes Join-Path itself throw
         # "Cannot find drive", which -- before this path was validated up
@@ -5833,36 +11181,55 @@ function Invoke-CitrixUsageAudit {
         # can fail, and is wrapped so its failure is rethrown with a message
         # a customer can act on.
         try {
-            if (-not (Test-Path -LiteralPath $config.OutputPath)) {
-                New-Item -ItemType Directory -Path $config.OutputPath -Force -ErrorAction Stop | Out-Null
+            if (-not (Test-Path -LiteralPath $Config.OutputPath)) {
+                New-Item -ItemType Directory -Path $Config.OutputPath -Force -ErrorAction Stop | Out-Null
             }
             # A directory that already exists is not necessarily writable
             # (a read-only location, a permissions issue) -- Test-Path only
             # confirms it is there. Probing with a real write-then-delete
             # catches that case too, not just "does not exist yet".
-            $writeProbePath = Join-Path $config.OutputPath ".citrixaudit-write-test-$stamp"
+            $writeProbePath = Join-Path $Config.OutputPath ".citrix-usage-report-write-test-$stamp"
             Set-Content -Path $writeProbePath -Value '' -Encoding UTF8 -ErrorAction Stop
             Remove-Item -LiteralPath $writeProbePath -Force -ErrorAction Stop
         } catch {
-            throw "The output path '$($config.OutputPath)' could not be created or is not writable. Check that the drive exists and that this account can write to it. ($($_.Exception.Message))"
+            throw "The output path '$($Config.OutputPath)' could not be created or is not writable. Check that the drive exists and that this account can write to it. ($($_.Exception.Message))"
         }
 
-        $runDir = Join-Path $config.OutputPath "CitrixUsageReport-$stamp"
+        $runDir = Join-Path $Config.OutputPath "CitrixUsageReport-$stamp"
         if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force -ErrorAction Stop | Out-Null }
 
-        Initialize-AuditLog -Path (Join-Path $runDir 'usage-report.log')
-        Write-AuditLog -Level Info -Message "Target: $($config.EnvironmentLabel)"
-        Write-AuditLog -Level Info -Message "Windows: $($config.Days -join ', ') day(s)"
+        Initialize-ReportLog -Path (Join-Path $runDir 'usage-report.log')
+        # The build that produced this run. A customer sends back a report and a
+        # log; without this, matching either to the script that made it depends on
+        # someone remembering which copy they were given.
+        Write-ReportLog -Level Info -Message "Version: $script:ReportVersion (built $script:ReportBuiltUtc)"
+        Write-ReportLog -Level Info -Message "Target: $($Config.EnvironmentLabel)"
+        Write-ReportLog -Level Info -Message "Windows: $($Config.Days -join ', ') day(s)"
+
+        # Refused before any data is fetched, not after the report is written:
+        # a merge export carries raw security identifiers unless it is
+        # anonymized, and it is the file that travels between sites and is
+        # kept for years. Exporting them should be a decision, not a default.
+        $wantMergeExport = [bool] $Config.ExportForMerge
+        if ($wantMergeExport -and -not $Config.Anonymize -and -not $Config.AllowUnanonymizedMergeExport) {
+            throw 'A merge export carries user identifiers (security identifiers) unless -Anonymize is also given, and it is the file that travels between sites and is kept for years. Add -Anonymize, or pass -AllowUnanonymizedMergeExport to export raw identifiers deliberately.'
+        }
+
+        # Before anything reaches the network, including the cloud token
+        # request. A machine defaulting to TLS 1.0 fails against Citrix Cloud
+        # with a connection error that names no protocol, which reads as a
+        # credential or network fault and sends the reader the wrong way.
+        Initialize-TlsProtocol
 
         # Which account authenticates is useful for diagnosing a 401 -- see
         # the account-aware message in Invoke-CitrixODataQuery (40-ODataClient.ps1).
         # The username is not sensitive and is safe to log; the password
         # never reaches this or any other log line.
-        if (-not $config.IsCloud -and -not $config.DemoData) {
-            if ($config.Credential) {
-                Write-AuditLog -Level Info -Message "Authenticating on-premises as $($config.Credential.UserName)."
+        if (-not $Config.IsCloud -and -not $Config.DemoData -and $mergePaths.Count -eq 0) {
+            if ($Config.Credential) {
+                Write-ReportLog -Level Info -Message "Authenticating on-premises as $($Config.Credential.UserName)."
             } else {
-                Write-AuditLog -Level Info -Message "Authenticating on-premises as the signed-in user ($env:USERDOMAIN\$env:USERNAME)."
+                Write-ReportLog -Level Info -Message "Authenticating on-premises as the signed-in user ($env:USERDOMAIN\$env:USERNAME)."
             }
         }
 
@@ -5871,99 +11238,367 @@ function Invoke-CitrixUsageAudit {
         # warn about here, only the fact that this run is unencrypted. Kept
         # short; the HTML report carries the same notice with a clickable
         # link to Citrix's TLS guidance.
-        if ($config.IsHttp) {
-            Write-AuditLog -Level Warn -Message "This report was generated over an unencrypted HTTP connection to the Monitor Service. See Citrix's guidance on securing the Monitor Service with TLS: $script:MonitorTlsGuidanceUrl"
+        if ($Config.IsHttp) {
+            Write-ReportLog -Level Warn -Message "This report was generated over an unencrypted HTTP connection to the Monitor Service. See Citrix's guidance on securing the Monitor Service with TLS: $script:MonitorTlsGuidanceUrl"
         }
 
         # ---- Collect ---------------------------------------------------------
-        $progress = {
-            param($entity, $count)
-            Write-Progress -Activity 'Collecting Citrix usage data' `
-                -Status "$entity : $count record(s)" -Id 1
-        }
-
-        $dataset = if ($config.DemoData) {
-            Write-AuditLog -Level Warn -Message 'Demo mode: generating synthetic data. No Citrix environment will be contacted.'
-            New-DemoDataset -Config $config
+        $dataset = if ($mergePaths -and $mergePaths.Count -gt 0) {
+            # Consolidating existing exports contacts no Citrix site at all.
+            #
+            # Recorded because the consolidated user count cannot be checked
+            # afterwards without it: the bridge merges on weaker evidence than
+            # a security identifier, so a reader comparing this report against
+            # the per-site ones needs to know it was in play.
+            Write-ReportLog -Level Info -Message (
+                'Cross-forest name matching (UPN bridge): {0}.' -f
+                $(if ($Config.UseUpnBridge) { 'ENABLED' } else { 'off (identifier matching only)' }))
+            if ($Config.ExcludeBridgeUpn.Count -gt 0) {
+                Write-ReportLog -Level Info -Message (
+                    'Excluded from name matching: {0} principal name(s).' -f $Config.ExcludeBridgeUpn.Count)
+            }
+            # Loading the exports and matching identities across them both
+            # happen inside this one call, so the panel cannot show them
+            # starting separately -- only the first is marked Active, and
+            # both are marked Done when it returns. Saying otherwise would
+            # be inventing a boundary that does not exist.
+            $activePhase = 'Load exports'
+            & $emitPhase 'Load exports' 'Active'
+            $consolidated = Get-ConsolidatedDatasetFromPaths -Paths $mergePaths `
+                -UseUpnBridge:$Config.UseUpnBridge `
+                -ExcludeBridgeUpn ([string[]] $Config.ExcludeBridgeUpn) `
+                -SaltPath ([string] $Config.SaltPath) `
+                -DefaultSaltDirectory $Config.OutputPath
+            & $emitPhase 'Load exports' 'Done'
+            & $emitPhase 'Match identities' 'Done'
+            $activePhase = $null
+            $consolidated
+        } elseif ($Config.DemoData) {
+            Write-ReportLog -Level Warn -Message 'Demo mode: generating synthetic data. No Citrix environment will be contacted.'
+            $activePhase = 'Generate'
+            & $emitPhase 'Generate' 'Active'
+            $demo = New-DemoDataset -Config $Config
+            & $emitPhase 'Generate' 'Done'
+            $activePhase = $null
+            $demo
         } else {
-            $auth = New-CitrixAuthContext -Config $config
-            Get-CitrixDataset -AuthContext $auth -Config $config -ProgressAction $progress
+            $activePhase = 'Connect'
+            & $emitPhase 'Connect' 'Active'
+            $auth = New-CitrixAuthContext -Config $Config
+            & $emitPhase 'Connect' 'Done'
+            $activePhase = 'Collect'
+            & $emitPhase 'Collect' 'Active'
+            $collected = Get-CitrixDataset -AuthContext $auth -Config $Config -ProgressAction $CollectAction
+            & $emitPhase 'Collect' 'Done'
+            $activePhase = $null
+            $collected
         }
 
         Write-Progress -Activity 'Collecting Citrix usage data' -Id 1 -Completed
 
         if (@($dataset.Sessions).Count -eq 0) {
-            Write-AuditLog -Level Warn -Message 'No sessions were returned for the requested period. The report will be empty. Check that the account can read Monitor data and that the site has had activity in this window.'
+            Write-ReportLog -Level Warn -Message 'No sessions were returned for the requested period. The report will be empty. Check that the account can read Monitor data and that the site has had activity in this window.'
         }
 
         # ---- Anonymize -------------------------------------------------------
+        # The merge export needs the dataset BEFORE anonymization, because the
+        # two anonymization schemes are different and must not be confused.
+        # ConvertTo-AnonymizedDataset assigns per-run pseudonyms and sets Sid
+        # to $null, which is right for a report read on its own -- but a merge
+        # export keyed on those could never be consolidated with anything,
+        # and with no SID at all Export-MergeData would drop every user and
+        # write an export containing nobody. Its own anonymization is the
+        # salted HMAC, which is stable across sites and across months.
+        $datasetForMerge = $dataset
+
+        # The salt is resolved here, before the identity map is built, because
+        # identity-map.csv now carries the UserKey that joins it to the merge
+        # export -- and that key cannot be computed without the salt. It is
+        # still not touched at config time: a run that fails before this point
+        # leaves no salt file behind for a report it never produced.
+        $saltBytes = $null
+        $saltPrint = $null
+        if ($wantMergeExport -and $Config.Anonymize) {
+            $resolvedSaltPath = [string] $Config.SaltPath
+            if ([string]::IsNullOrWhiteSpace($resolvedSaltPath)) {
+                # Beside identity-map.csv rather than inside the timestamped
+                # run directory: it has to outlive any single run and be found
+                # again by the next one.
+                $resolvedSaltPath = Join-Path $Config.OutputPath 'anonymization-salt.txt'
+            }
+            $saltInfo = Get-ReportSalt -Path $resolvedSaltPath
+            $saltBytes = $saltInfo.Salt
+            $saltPrint = $saltInfo.Fingerprint
+        }
+
         $map = $null
         $mapRows = @()
-        if ($config.Anonymize) {
-            Write-AuditLog -Level Info -Message 'Anonymizing usernames...'
+        if ($Config.Anonymize) {
+            Write-ReportLog -Level Info -Message 'Anonymizing usernames...'
             $map = New-AnonymizationMap -Dataset $dataset
-            # Snapshot the decode key BEFORE the dataset is anonymised: this
+            # Snapshot the decode key BEFORE the dataset is anonymized: this
             # is the only moment $dataset.Users still holds real usernames,
             # and identity-map.csv is worthless to the customer without them.
-            $mapRows = @(New-IdentityMapRows -Map $map -Users $dataset.Users)
+            $mapRows = @(New-IdentityMapRows -Map $map -Users $dataset.Users -Salt $saltBytes)
             $dataset = ConvertTo-AnonymizedDataset -Dataset $dataset -Map $map
         }
 
         # ---- Analyze ---------------------------------------------------------
-        Write-AuditLog -Level Info -Message 'Analyzing...'
-        $analysis = Invoke-AuditAnalysis -Dataset $dataset -Config $config
+        Write-ReportLog -Level Info -Message 'Analyzing...'
+        $activePhase = 'Analyze'
+        & $emitPhase 'Analyze' 'Active'
+        $analysis = Invoke-ReportAnalysis -Dataset $dataset -Config $Config `
+            -ProgressAction $ProgressAction
+        Write-Progress -Activity 'Analyzing usage data' -Id 2 -Completed
+        & $emitPhase 'Analyze' 'Done'
+        $activePhase = $null
 
         # ---- Render ----------------------------------------------------------
+        $activePhase = 'Render'
+        & $emitPhase 'Render' 'Active'
         $reportPath = Join-Path $runDir 'CitrixUsageReport.html'
+        $opened.Add($reportPath)
         Save-HtmlReport -Analysis $analysis -Path $reportPath | Out-Null
+        [void] $opened.Remove($reportPath)
+        & $emitPhase 'Render' 'Done'
+        $activePhase = $null
 
-        if ($config.ExportRawData) {
-            Export-AuditData -Analysis $analysis -Dataset $dataset -OutputPath $runDir `
+        # Everything from here to the summary is the Export phase. The panel
+        # only ever shows it when Get-RunPhaseList said it would happen, and
+        # Update-RunPanel ignores a name it has no label for, so emitting it
+        # unconditionally costs nothing and cannot get out of step with the
+        # conditions that decide whether anything is actually written.
+        $activePhase = 'Export'
+        & $emitPhase 'Export' 'Active'
+
+        if ($Config.ExportRawData) {
+            # Export-ReportData (src/80-Export.ps1) writes a fixed, known set
+            # of filenames, but only returns the list of ones it actually
+            # wrote, and only once it has finished -- a throw partway through
+            # never reaches this line to say which of them exist yet. Listing
+            # the candidate paths up front, before the call, is what lets the
+            # cleanup in the catch blocks below remove whichever of them a
+            # partial run left behind. Filenames never created are simply not
+            # found when that cleanup checks Test-Path, so listing all of
+            # them here costs nothing.
+            $exportPaths = @(
+                (Join-Path $runDir 'data.json'),
+                (Join-Path $runDir 'summary.csv'),
+                (Join-Path $runDir 'daily-trend.csv'),
+                (Join-Path $runDir 'sessions.csv'),
+                (Join-Path $runDir 'identity-map.csv')
+            )
+            foreach ($p in $exportPaths) { $opened.Add($p) }
+            Export-ReportData -Analysis $analysis -Dataset $dataset -OutputPath $runDir `
                 -Map $map -MapRows $mapRows | Out-Null
+            foreach ($p in $exportPaths) { [void] $opened.Remove($p) }
         } elseif ($map) {
             # The identity map is still written even when raw data export is
-            # off, so the operator can decode the (possibly anonymised)
-            # report later. Export-AuditData is deliberately NOT called here:
+            # off, so the operator can decode the (possibly anonymized)
+            # report later. Export-ReportData is deliberately NOT called here:
             # it always writes the full raw export set (data.json,
             # summary.csv, daily-trend.csv, sessions.csv) alongside
             # identity-map.csv, with no way to ask for the map alone. Calling
             # it in this branch would hand the operator every raw file they
             # just declined by leaving -ExportRawData off, silently defeating
             # the toggle. Only identity-map.csv is written here, matching
-            # Export-AuditData's own identity-map.csv logic exactly.
+            # Export-ReportData's own identity-map.csv logic exactly.
             $mapPath = Join-Path $runDir 'identity-map.csv'
+            $opened.Add($mapPath)
             $mapRows | Export-Csv -Path $mapPath -NoTypeInformation -Encoding UTF8
-            Write-AuditLog -Level Warn -Message "Identity map written to $mapPath. Keep this file. Do not send it with the report."
+            [void] $opened.Remove($mapPath)
+            Write-ReportLog -Level Warn -Message "Identity map written to $mapPath. Keep this file. Do not send it with the report."
         }
+
+        if ($wantMergeExport) {
+            $mergeExportPath = Join-Path $runDir 'merge-export.json'
+            $opened.Add($mergeExportPath)
+            Export-MergeData -Dataset $datasetForMerge -Config $Config `
+                -Path $mergeExportPath `
+                -Salt $saltBytes -SaltFingerprint $saltPrint | Out-Null
+            [void] $opened.Remove($mergeExportPath)
+        }
+
+        # The consolidated count is the number a customer is most likely to be
+        # challenged on and, until this file existed, the only one they could
+        # not check: the report named no people, and the merge export and the
+        # per-site identity maps shared no column to join on.
+        #
+        # Written for every consolidation, anonymized or not, because it
+        # discloses nothing by itself -- every value in it is already in the
+        # merge exports that were handed over. It becomes readable only when
+        # joined, on the customer's own machine, against the identity-map.csv
+        # files that never left their sites.
+        if ($dataset.PSObject.Properties['Consolidation'] -and $dataset.Consolidation) {
+            $rows = @($dataset.Consolidation.IdentityRows)
+            if ($rows.Count -gt 0) {
+                $consolidatedMapPath = Join-Path $runDir 'consolidated-identity-map.csv'
+                $labelled = foreach ($r in $rows) {
+                    # The label the report itself uses for this person, so the
+                    # two can be read side by side. Anonymizing a consolidation
+                    # relabels the already-pseudonymous keys as User-NNNN; when
+                    # it is off, the key IS the label.
+                    $pseudo = [string] $r.ConsolidatedKey
+                    if ($map -and $map.ContainsKey($r.ConsolidatedKey)) {
+                        $pseudo = [string] $map[$r.ConsolidatedKey]
+                    }
+                    [pscustomobject]@{
+                        Pseudonym       = $pseudo
+                        ConsolidatedKey = $r.ConsolidatedKey
+                        UserKey         = $r.UserKey
+                        Site            = $r.Site
+                        SourceFile      = $r.SourceFile
+                        MatchedBy       = $r.MatchedBy
+                    }
+                }
+                $opened.Add($consolidatedMapPath)
+                $labelled | Export-Csv -Path $consolidatedMapPath -NoTypeInformation -Encoding UTF8
+                [void] $opened.Remove($consolidatedMapPath)
+                Write-ReportLog -Level Info -Message "Consolidated identity map written to $consolidatedMapPath. Join its UserKey column against each site's identity-map.csv to check which accounts were treated as one person."
+
+                $bridged = @($rows | Where-Object { $_.MatchedBy -like '*UpnBridge*' })
+                if ($bridged.Count -gt 0) {
+                    Write-ReportLog -Level Warn -Message "$($bridged.Count) of $($rows.Count) identity row(s) were merged using the cross-forest name match, which is weaker evidence than a security identifier. They are marked UpnBridge in that file and are the ones worth checking by hand."
+                }
+            }
+        }
+
+        & $emitPhase 'Export' 'Done'
+        $activePhase = $null
 
         # ---- Summary ---------------------------------------------------------
         $widest = $analysis.Windows | Sort-Object Days -Descending | Select-Object -First 1
 
-        Write-AuditLog -Level Success -Message ''
-        Write-AuditLog -Level Success -Message 'Report complete.'
-        Write-AuditLog -Level Info -Message "  Unique users ($($widest.Days) days): $($widest.UniqueUsers)"
-        Write-AuditLog -Level Info -Message "  Peak concurrent          : $($widest.Concurrency.Peak)"
-        Write-AuditLog -Level Info -Message "  p95 concurrent           : $([math]::Round($widest.Concurrency.P95, 0))"
-        Write-AuditLog -Level Info -Message "  Report                   : $reportPath"
+        Write-ReportLog -Level Success -Message ''
+        Write-ReportLog -Level Success -Message 'Report complete.'
+        Write-ReportLog -Level Info -Message "  Unique users ($($widest.Days) days): $($widest.UniqueUsers)"
+        Write-ReportLog -Level Info -Message "  Peak concurrent sessions : $($widest.Concurrency.Peak)"
+        Write-ReportLog -Level Info -Message "  p95 concurrent sessions  : $([math]::Round($widest.Concurrency.P95, 0))"
+        Write-ReportLog -Level Info -Message "  Report                   : $reportPath"
 
         if ($widest.IsTruncated) {
-            Write-AuditLog -Level Warn -Message "  NOTE: the $($widest.Days)-day window is truncated to $($widest.AvailableDays) days of retained history. The figures are a lower bound."
+            Write-ReportLog -Level Warn -Message "  NOTE: the $($widest.Days)-day window is truncated to $($widest.AvailableDays) days of retained history. The figures are a lower bound."
         }
 
         if ($map) {
-            Write-AuditLog -Level Warn -Message '  Keep identity-map.csv. Do not send it with the report.'
+            Write-ReportLog -Level Warn -Message '  Keep identity-map.csv. Do not send it with the report.'
         }
 
-        if ([Environment]::UserInteractive -and -not $BoundParameters['NoGui']) {
+        if ([Environment]::UserInteractive -and -not $NoLaunch) {
             try { Start-Process $reportPath } catch { }
         }
 
-        return 0
+        return [pscustomobject]@{
+            ExitCode     = 0
+            ReportPath   = $reportPath
+            RunDirectory = $runDir
+        }
+
+    } catch [System.OperationCanceledException] {
+        # Distinguished from the general catch below so a cancel is reported
+        # as ExitCode 2, not 1 -- the console entry point and the panel both
+        # depend on that distinction to tell "the operator stopped this"
+        # apart from "this failed". Every existing Assert-NotCancelled call
+        # (the Collect-phase check in src/40-ODataClient.ps1 and the
+        # Analyze-phase checks in src/60-Analytics.ps1) sits at or before
+        # Analyze, so in practice $opened is still empty here -- Save-
+        # HtmlReport runs after Analyze completes -- but the cleanup loop is
+        # unconditional so a future cancellation check added downstream of
+        # Render is covered for free.
+        if ($activePhase) { & $emitPhase $activePhase 'Cancelled' }
+        Write-ReportLog -Level Warn -Message 'Run canceled. Removing anything that was only part-written.'
+        foreach ($p in $opened) {
+            try { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction Stop } }
+            catch { Write-ReportLog -Level Debug -Message "Could not remove $p : $($_.Exception.Message)" }
+        }
+        return [pscustomobject]@{ ExitCode = 2; ReportPath = $null; RunDirectory = $runDir }
 
     } catch {
+        # A plain (non-cancellation) failure after Render has begun leaves
+        # exactly the same kind of truncated, confidently-wrong file behind
+        # as a cancel does, so the same cleanup applies here before anything
+        # is logged. $runDir and its log are never added to $opened and so
+        # are never touched -- the log is the evidence of what happened, and
+        # is deliberately kept whichever way the run ended.
+        if ($activePhase) { & $emitPhase $activePhase 'Failed' }
+        foreach ($p in $opened) {
+            try { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction Stop } }
+            catch { Write-ReportLog -Level Debug -Message "Could not remove $p : $($_.Exception.Message)" }
+        }
+
         $message = $_.Exception.Message
-        Write-AuditLog -Level Error -Message "Report failed: $message"
-        Write-AuditLog -Level Debug -Message $_.ScriptStackTrace
+        Write-ReportLog -Level Error -Message "Report failed: $message"
+        Write-ReportLog -Level Debug -Message $_.ScriptStackTrace
+        Write-Host ''
+        Write-Host 'The report did not complete. See the message above and the run log for detail.' -ForegroundColor Red
+        return [pscustomobject]@{
+            ExitCode     = 1
+            ReportPath   = $null
+            RunDirectory = $runDir
+        }
+    }
+}
+
+function Invoke-CitrixUsageReport {
+    <#
+    .SYNOPSIS
+        Runs a complete usage report.
+    .DESCRIPTION
+        The console entry point and nothing more: it works out where output
+        should go, asks Get-ReportRunConfig what to run, and hands that to
+        Invoke-ReportRun. The two halves are separate functions so that a
+        caller which is not a console -- the dialog, handing the work to a
+        background runspace -- can use the second without the first.
+    .OUTPUTS
+        An exit code: 0 success, 1 failure, 2 canceled.
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([hashtable] $BoundParameters = @{})
+
+    # See the long note in Invoke-ReportRun for why nothing in this call
+    # chain may continue past a failed cmdlet. Invoke-ReportRun reports its
+    # own failures as an exit code and never throws, so this try/catch can
+    # never double-report a failure Invoke-ReportRun already handled -- but
+    # it still wraps the call (Task 5's review flagged this: it used to wrap
+    # only the configuration phase) so that IF that guarantee were ever
+    # violated, the customer sees this catch's message instead of a raw
+    # stack trace dumped straight to the console.
+    $ErrorActionPreference = 'Stop'
+
+    try {
+        # ---- Configuration -------------------------------------------------
+        $defaultOut = if ($BoundParameters.ContainsKey('OutputPath')) {
+            $BoundParameters['OutputPath']
+        } else {
+            Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'CitrixUsageReport'
+        }
+
+        $config = Get-ReportRunConfig -BoundParameters $BoundParameters -DefaultOutputPath $defaultOut
+
+        if (-not $config) {
+            Write-Host 'Canceled.' -ForegroundColor Yellow
+            return 2
+        }
+
+        # The dialog ran the report itself and this is its outcome, not a
+        # configuration still waiting to be run. Running it again here is
+        # exactly the duplicate-run defect the marker shape exists to
+        # prevent -- see Get-ReportRunConfig.
+        if ($config.PSObject.Properties['GuiExitCode']) {
+            return [int] $config.GuiExitCode
+        }
+
+        # -NoGui says the operator is not sitting in front of a graphical
+        # session, so opening the finished report in a browser would be
+        # unwelcome. Threading it through the parameter is how the guard that
+        # used to read $BoundParameters inline survives the split.
+        $result = Invoke-ReportRun -Config $config -NoLaunch:([bool] $BoundParameters['NoGui'])
+        return $result.ExitCode
+    } catch {
+        $message = $_.Exception.Message
+        Write-ReportLog -Level Error -Message "Report failed: $message"
+        Write-ReportLog -Level Debug -Message $_.ScriptStackTrace
         Write-Host ''
         Write-Host 'The report did not complete. See the message above and the run log for detail.' -ForegroundColor Red
         return 1
@@ -5972,8 +11607,8 @@ function Invoke-CitrixUsageAudit {
 
 # Entry point. Runs only when this file is executed as a script, never when it
 # is dot-sourced by the test suite.
-if ($MyInvocation.InvocationName -ne '.' -and -not $env:CITRIXAUDIT_SUPPRESS_MAIN) {
-    exit (Invoke-CitrixUsageAudit -BoundParameters $PSBoundParameters)
+if ($MyInvocation.InvocationName -ne '.' -and -not $env:CITRIXUSAGEREPORT_SUPPRESS_MAIN) {
+    exit (Invoke-CitrixUsageReport -BoundParameters $PSBoundParameters)
 }
 
 # endregion 99-Main.ps1
