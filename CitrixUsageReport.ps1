@@ -1,8 +1,8 @@
 ﻿#requires -Version 5.1
 # ============================================================================
 #  Citrix Usage Report - GENERATED FILE, DO NOT EDIT DIRECTLY
-#  Version: 1.11.1
-#  Built  : 2026-09-29T17:07:25Z
+#  Version: 1.11.2
+#  Built  : 2026-10-01T22:18:04Z
 #  Source : https://git.shillapps.com/shane/citrix-usage-report
 #  Edit the files under src/ and re-run build.ps1 instead.
 # ============================================================================
@@ -248,8 +248,8 @@ param(
 # placeholders in place. That reports as a development build rather than
 # claiming a release number it has not been through the build for.
 # ---------------------------------------------------------------------------
-$script:ReportVersion = '1.11.1'
-$script:ReportBuiltUtc = '2026-09-29T17:07:25Z'
+$script:ReportVersion = '1.11.2'
+$script:ReportBuiltUtc = '2026-10-01T22:18:04Z'
 
 # Where this script lives, captured while $PSCommandPath is still in scope.
 #
@@ -260,6 +260,14 @@ $script:ReportBuiltUtc = '2026-09-29T17:07:25Z'
 # running from src/ it is only the header, which is why the worker takes an
 # explicit bootstrap path rather than assuming this one is enough.
 $script:ReportScriptPath = $PSCommandPath
+
+# The text PowerShell parsed for this script, held in memory. The worker
+# loads THIS rather than the file: reading the file again repeats the
+# execution policy check inside a runspace that cannot show its prompt (see
+# Get-ReportBootstrap in src/93-RunHost.ps1). Guarded because when the
+# worker itself dot-sources this text, MyCommand is not a script file.
+$script:ReportScriptText = $null
+try { $script:ReportScriptText = $MyInvocation.MyCommand.ScriptBlock.ToString() } catch { }
 
 # endregion 00-Header.ps1
 
@@ -8250,7 +8258,7 @@ function New-ReportGuiForm {
     $fnReadRunEvents           = ${function:Read-RunEvents}
     $fnStartReportWorker       = ${function:Start-ReportWorker}
     $fnStopReportWorkerAsync   = ${function:Stop-ReportWorkerAsync}
-    $fnGetReportBootstrapPath  = ${function:Get-ReportBootstrapPath}
+    $fnGetReportBootstrap      = ${function:Get-ReportBootstrap}
 
     $p = Get-GuiPalette
     $jasper = $p['Jasper80']
@@ -9656,11 +9664,16 @@ function New-ReportGuiForm {
             # Start-ReportWorker never throws -- a construction failure comes
             # back as an already-torn-down worker with Done already published
             # -- so the timer below always has something to drain.
+            # The script's loaded text for a built script, never its path --
+            # see Get-ReportBootstrap for the execution policy failure that
+            # loading the file a second time caused in 1.11.0.
+            $bootstrap = & $fnGetReportBootstrap
             $built.Worker = & $fnStartReportWorker `
                 -Channel $built.Channel `
                 -Source $built.Source `
                 -Work $built.WorkBlock `
-                -BootstrapPath (& $fnGetReportBootstrapPath) `
+                -BootstrapScript $bootstrap.Script `
+                -BootstrapPath $bootstrap.Paths `
                 -Arguments @{ Config = $cfg; Phases = [string[]] $phases }
 
             $timer.Start()
@@ -10400,6 +10413,45 @@ function Get-ReportBootstrapPath {
     return [string[]] @($ScriptPath)
 }
 
+function Get-ReportBootstrap {
+    <#
+    .SYNOPSIS
+        What a worker runspace should load to get this script's functions:
+        the script's own already-loaded text, or a list of files.
+    .DESCRIPTION
+        A built script hands over its TEXT, never its path. Dot-sourcing the
+        file again puts it through the execution policy check a second time,
+        inside a runspace with no console. Under an Unrestricted policy, a
+        file still carrying its downloaded-from-internet mark needs the
+        "Run only scripts that you trust" prompt answered -- which the
+        operator already did once, for this same file, to start the script --
+        and a runspace with no host cannot ask, so the load fails with
+        "AuthorizationManager check failed". Shipped in 1.11.0, measured on a
+        customer machine. The text is the copy PowerShell parsed and the
+        operator approved, held in memory: verified that an edit made to the
+        file on disk after start-up does not reach it, so the worker runs what
+        was approved and not whatever is on disk a moment later.
+
+        The src layout still loads files: the header's own text is only the
+        header, which defines nothing, and nothing a customer runs uses it.
+    .OUTPUTS
+        hashtable: Script (string, or $null) and Paths (string[], or empty).
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [AllowNull()][string] $ScriptPath = $script:ReportScriptPath,
+        [AllowNull()][string] $ScriptText = $script:ReportScriptText
+    )
+
+    $paths = @(Get-ReportBootstrapPath -ScriptPath $ScriptPath)
+
+    if ($paths.Count -eq 1 -and -not [string]::IsNullOrEmpty($ScriptText)) {
+        return @{ Script = $ScriptText; Paths = [string[]] @() }
+    }
+    return @{ Script = $null; Paths = [string[]] $paths }
+}
+
 function Start-ReportWorker {
     <#
     .SYNOPSIS
@@ -10433,6 +10485,10 @@ function Start-ReportWorker {
         # produce it. A single string still binds (PowerShell wraps it), so
         # the one-file built case reads exactly as it did before.
         [string[]] $BootstrapPath,
+        # Script source dot-sourced before any $BootstrapPath file, without
+        # reading anything from disk -- see Get-ReportBootstrap for why a
+        # built script must use this rather than its own path.
+        [string] $BootstrapScript,
         [hashtable] $Arguments = @{}
     )
 
@@ -10459,7 +10515,7 @@ function Start-ReportWorker {
         # that is missing, and reaching for it would leave the panel waiting
         # on a Done that never comes.
         [void] $shell.AddScript({
-            param($Channel, $Source, $Work, $BootstrapPath, $Arguments)
+            param($Channel, $Source, $Work, $BootstrapPath, $BootstrapScript, $Arguments)
 
             $started = [datetime]::UtcNow
             # Defaults to failure, not success. An unrecognised result shape
@@ -10473,7 +10529,8 @@ function Start-ReportWorker {
             $reportPath = $null
 
             try {
-                if ($BootstrapPath -and @($BootstrapPath).Count -gt 0) {
+                $hasPaths = $BootstrapPath -and @($BootstrapPath).Count -gt 0
+                if ($BootstrapScript -or $hasPaths) {
                     # $env: is PROCESS scope, not runspace scope -- shared
                     # with the parent session and every other runspace in
                     # this process. Verified directly: a variable set inside
@@ -10498,8 +10555,17 @@ function Start-ReportWorker {
                         # of these failing throws, which the catch blocks below
                         # turn into a Done event rather than a panel waiting
                         # forever for one.
-                        foreach ($bootstrapFile in $BootstrapPath) {
-                            . $bootstrapFile
+                        #
+                        # Text first, compiled here so it binds to this
+                        # runspace. No file is read, so no execution policy
+                        # check runs -- see Get-ReportBootstrap.
+                        if ($BootstrapScript) {
+                            . ([scriptblock]::Create($BootstrapScript))
+                        }
+                        if ($hasPaths) {
+                            foreach ($bootstrapFile in $BootstrapPath) {
+                                . $bootstrapFile
+                            }
                         }
                     } finally {
                         if ($null -eq $priorSuppressMain) {
@@ -10599,6 +10665,7 @@ function Start-ReportWorker {
         [void] $shell.AddArgument($Source)
         [void] $shell.AddArgument($Work)
         [void] $shell.AddArgument($BootstrapPath)
+        [void] $shell.AddArgument($BootstrapScript)
         [void] $shell.AddArgument($Arguments)
 
         $handle = $shell.BeginInvoke()
